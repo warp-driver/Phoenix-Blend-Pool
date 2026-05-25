@@ -7,21 +7,30 @@ use stellar_xdr::curr::{
     Int128Parts, Limits, ReadXdr, ScAddress, ScString, ScSymbol, ScVal, StringM, WriteXdr,
 };
 
-fn decode_envelope_payload(bytes: &[u8]) -> (String, i128) {
+fn decode_envelope_payload(bytes: &[u8]) -> (String, Option<i128>) {
     let decoded = ScVal::from_xdr(bytes, Limits::none()).unwrap();
     let elements = match decoded {
         ScVal::Vec(Some(v)) => v.0.to_vec(),
         other => panic!("expected ScVec, got {other:?}"),
     };
-    assert_eq!(elements.len(), 2, "enum payload = [tag, amount]");
+    assert!(
+        elements.len() == 1 || elements.len() == 2,
+        "enum payload is [tag] or [tag, amount]"
+    );
 
     let tag = match &elements[0] {
         ScVal::Symbol(ScSymbol(s)) => s.to_string(),
         other => panic!("expected tag Symbol, got {other:?}"),
     };
-    let amount = match &elements[1] {
-        ScVal::I128(Int128Parts { hi, lo }) => ((*hi as i128) << 64) | (*lo as u128 as i128),
-        other => panic!("expected I128, got {other:?}"),
+    let amount = if elements.len() == 2 {
+        match &elements[1] {
+            ScVal::I128(Int128Parts { hi, lo }) => {
+                Some(((*hi as i128) << 64) | (*lo as u128 as i128))
+            }
+            other => panic!("expected I128, got {other:?}"),
+        }
+    } else {
+        None
     };
     (tag, amount)
 }
@@ -32,7 +41,7 @@ fn payload_encodes_to_blend_variant() {
     let bytes = payload::encode(Direction::ToBlend, amount).unwrap();
     let (tag, decoded_amount) = decode_envelope_payload(&bytes);
     assert_eq!(tag, "ToBlend");
-    assert_eq!(decoded_amount, amount);
+    assert_eq!(decoded_amount, Some(amount));
 }
 
 #[test]
@@ -41,7 +50,16 @@ fn payload_encodes_from_blend_variant() {
     let bytes = payload::encode(Direction::FromBlend, amount).unwrap();
     let (tag, decoded_amount) = decode_envelope_payload(&bytes);
     assert_eq!(tag, "FromBlend");
-    assert_eq!(decoded_amount, amount);
+    assert_eq!(decoded_amount, Some(amount));
+}
+
+#[test]
+fn payload_encodes_harvest_yield_unit_variant() {
+    // HarvestYield carries no data; encoding should emit just [Symbol].
+    let bytes = payload::encode(Direction::HarvestYield, 0).unwrap();
+    let (tag, decoded_amount) = decode_envelope_payload(&bytes);
+    assert_eq!(tag, "HarvestYield");
+    assert_eq!(decoded_amount, None);
 }
 
 #[test]
@@ -51,7 +69,7 @@ fn payload_roundtrips_negative_amounts() {
     let bytes = payload::encode(Direction::ToBlend, -1).unwrap();
     let (tag, decoded) = decode_envelope_payload(&bytes);
     assert_eq!(tag, "ToBlend");
-    assert_eq!(decoded, -1);
+    assert_eq!(decoded, Some(-1));
 }
 
 #[test]

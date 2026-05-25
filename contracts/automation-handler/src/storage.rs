@@ -9,6 +9,10 @@ pub enum DataKey {
     BlendPool,
     Usdc,
     Xlm,
+    Blnd,
+    BlndSwapPool,
+    UsdcReserveTokenId,
+    PrincipalSupplied,
     Version,
     EventSeen(BytesN<20>),
 }
@@ -51,6 +55,41 @@ address_accessors!(
 );
 address_accessors!(get_usdc, set_usdc, DataKey::Usdc, "usdc not set");
 address_accessors!(get_xlm, set_xlm, DataKey::Xlm, "xlm not set");
+address_accessors!(get_blnd, set_blnd, DataKey::Blnd, "blnd not set");
+address_accessors!(
+    get_blnd_swap_pool,
+    set_blnd_swap_pool,
+    DataKey::BlndSwapPool,
+    "blnd swap pool not set"
+);
+
+pub fn set_usdc_reserve_token_id(env: &Env, id: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::UsdcReserveTokenId, &id);
+}
+
+pub fn get_usdc_reserve_token_id(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::UsdcReserveTokenId)
+        .expect("usdc reserve token id not set")
+}
+
+/// Running sum of net USDC supplied to Blend. Incremented on ToBlend, decremented
+/// on FromBlend. Used by HarvestYield to compute interest = redeemable - principal.
+pub fn set_principal_supplied(env: &Env, amount: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::PrincipalSupplied, &amount);
+}
+
+pub fn get_principal_supplied(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::PrincipalSupplied)
+        .unwrap_or(0)
+}
 
 pub fn set_version(env: &Env, v: &String) {
     env.storage().instance().set(&DataKey::Version, v);

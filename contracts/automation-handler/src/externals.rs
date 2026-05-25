@@ -80,4 +80,9 @@ pub trait BlendPool {
         to: Address,
         requests: Vec<BlendRequest>,
     ) -> BlendPositions;
+
+    /// Claim BLND emissions. `reserve_token_ids` identifies which (reserve, token-side)
+    /// pairs to claim for; each id = reserve_index * 2 + (0 for d-tokens, 1 for b-tokens).
+    /// Returns the total BLND transferred to `to`.
+    fn claim(env: Env, from: Address, reserve_token_ids: Vec<u32>, to: Address) -> i128;
 }
