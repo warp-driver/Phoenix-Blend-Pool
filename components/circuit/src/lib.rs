@@ -22,11 +22,16 @@ impl Guest for Component {
 }
 
 fn run_inner(trigger_action: TriggerAction) -> anyhow::Result<Vec<WasmResponse>> {
-    let event = match trigger_action.data {
-        TriggerData::StellarContractEvent(e) => e.event,
-        _ => anyhow::bail!("expected StellarContractEvent trigger"),
-    };
+    match trigger_action.data {
+        TriggerData::StellarContractEvent(e) => handle_swap_event(e.event),
+        TriggerData::Cron(_) => Ok(vec![harvest_yield_response()?]),
+        _ => anyhow::bail!("unexpected trigger type"),
+    }
+}
 
+fn handle_swap_event(
+    event: warpdrive::types::chain::StellarEvent,
+) -> anyhow::Result<Vec<WasmResponse>> {
     // tx_hash:op_index — same accumulator key Soroban uses for canonical
     // event_id derivation. We rely on it being unique per logical swap.
     let key = format!(
@@ -66,6 +71,18 @@ fn run_inner(trigger_action: TriggerAction) -> anyhow::Result<Vec<WasmResponse>>
     }
 
     Ok(vec![])
+}
+
+/// Cron-fired HarvestYield. No accumulator needed — every tick is a fresh
+/// "harvest now" instruction, and the framework assigns a unique event_id
+/// per cron firing so the handler dedupes naturally.
+fn harvest_yield_response() -> anyhow::Result<WasmResponse> {
+    let bytes = payload::encode(payload::Direction::HarvestYield, 0)?;
+    Ok(WasmResponse {
+        payload: bytes,
+        ordering: None,
+        event_id_salt: None,
+    })
 }
 
 export!(Component);

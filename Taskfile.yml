@@ -64,6 +64,10 @@ vars:
   TRIGGER_CHAIN: '{{.TRIGGER_CHAIN | default "stellar:pubnet"}}'
   MANAGER_CHAIN: '{{.MANAGER_CHAIN | default "stellar:testnet"}}'
   WORKFLOW_ID: '{{.WORKFLOW_ID | default "rebalance"}}'
+  HARVEST_WORKFLOW_ID: '{{.HARVEST_WORKFLOW_ID | default "harvest"}}'
+  # Standard cron with seconds field: "sec min hour day-of-month month day-of-week".
+  # Default: top of every 4 hours.
+  HARVEST_SCHEDULE: '{{.HARVEST_SCHEDULE | default "0 0 0,4,8,12,16,20 * * *"}}'
   SIGNER_WEIGHT: '{{.SIGNER_WEIGHT | default "100"}}'
   THRESHOLD_NUM: '{{.THRESHOLD_NUM | default "1"}}'
   THRESHOLD_DEN: '{{.THRESHOLD_DEN | default "1"}}'
@@ -123,9 +127,14 @@ tasks:
 
   build-service:
     desc: |
-      Build service.json declaratively via warpdrive-cli. Requires
-      out/handler.json (from `task deploy-handler`) and uploaded component
-      digests at out/circuit.digest and out/aggregator.digest.
+      Build service.json declaratively via warpdrive-cli. Two workflows are
+      configured against the same circuit + aggregator components:
+        - {{.WORKFLOW_ID}}: triggers on Phoenix swap events, emits
+          ToBlend/FromBlend rebalance actions.
+        - {{.HARVEST_WORKFLOW_ID}}: cron-triggered on schedule
+          "{{.HARVEST_SCHEDULE}}", emits HarvestYield.
+      Requires out/handler.json (from `task deploy-handler`) and uploaded
+      component digests at out/circuit.digest and out/aggregator.digest.
     deps: [build-circuit]
     cmds:
       - mkdir -p service
@@ -137,6 +146,8 @@ tasks:
         CIRCUIT_DIGEST=$(cat out/circuit.digest)
         AGG_DIGEST=$(cat out/aggregator.digest)
         warpdrive-cli service -f {{.SERVICE_FILE}} init --name phoenix-blend-pool
+
+        # ── workflow 1: rebalance (Stellar swap events) ────────────────────
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow add --id {{.WORKFLOW_ID}}
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow trigger \
             --id {{.WORKFLOW_ID}} set-stellar \
@@ -154,6 +165,23 @@ tasks:
             --id {{.WORKFLOW_ID}} component config \
             --values "chain={{.MANAGER_CHAIN}}" \
             --values "service_handler=$HANDLER"
+
+        # ── workflow 2: harvest (cron) ─────────────────────────────────────
+        warpdrive-cli service -f {{.SERVICE_FILE}} workflow add --id {{.HARVEST_WORKFLOW_ID}}
+        warpdrive-cli service -f {{.SERVICE_FILE}} workflow trigger \
+            --id {{.HARVEST_WORKFLOW_ID}} set-cron \
+            --schedule "{{.HARVEST_SCHEDULE}}"
+        warpdrive-cli service -f {{.SERVICE_FILE}} workflow component \
+            --id {{.HARVEST_WORKFLOW_ID}} set-source-digest --digest "$CIRCUIT_DIGEST"
+        warpdrive-cli service -f {{.SERVICE_FILE}} workflow submit \
+            --id {{.HARVEST_WORKFLOW_ID}} set-aggregator
+        warpdrive-cli service -f {{.SERVICE_FILE}} workflow submit \
+            --id {{.HARVEST_WORKFLOW_ID}} component set-source-digest --digest "$AGG_DIGEST"
+        warpdrive-cli service -f {{.SERVICE_FILE}} workflow submit \
+            --id {{.HARVEST_WORKFLOW_ID}} component config \
+            --values "chain={{.MANAGER_CHAIN}}" \
+            --values "service_handler=$HANDLER"
+
         warpdrive-cli service -f {{.SERVICE_FILE}} manager set-stellar \
             --chain {{.MANAGER_CHAIN}} --address "$PROJECT_ROOT"
         tmp=$(mktemp)

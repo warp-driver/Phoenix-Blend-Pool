@@ -25,9 +25,13 @@ WarpDrive operators sign the envelope; the **aggregator** (`components/aggregato
 
 The handler is the address configured as the blended pool's delegate via `set_delegate(...)`.
 
+The service deploys **two workflows** sharing the same circuit + aggregator wasms:
+
+- **`rebalance`** — Stellar-event trigger on the blended pool's `swap` topic. Emits `ToBlend` / `FromBlend` based on swap direction.
+- **`harvest`** — cron trigger (default `"0 0 0,4,8,12,16,20 * * *"` = top of every 4 hours). Emits `HarvestYield`. Override `HARVEST_SCHEDULE` to tune.
+
 ## What it does NOT do (yet)
 
-- **HarvestYield trigger.** The handler entrypoint exists and is callable, but the circuit doesn't emit `HarvestYield` automatically. Production would use a heartbeat trigger (every N hours) or a threshold trigger (when accumulated yield > X). For now it can be invoked manually with a hand-built envelope.
 - A real drift-vs-target trigger for the rebalance actions (current v1 logic is "emit 10% of every USDC-touching swap"; production should compare current liquid ratio against a 50% target).
 - Cooldown between rebalances (currently fires on every relevant swap).
 - Multi-operator deploy beyond a single dev node.
