@@ -1,0 +1,9 @@
+package phoenix-blend-pool:components;
+
+world circuit-world {
+    include warpdrive:vectr/warpdrive-world@2.12.0;
+}
+
+world aggregator-world {
+    include warpdrive:aggregator/aggregator-world@2.12.0;
+}

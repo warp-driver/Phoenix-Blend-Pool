@@ -1,0 +1,22 @@
+[package]
+name = "blend-rebalance-circuit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.100"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+stellar-xdr = { version = "26.0.0", features = ["serde", "serde_json", "base64"] }
+wit-bindgen = "0.53.1"
+
+[package.metadata.component]
+package = "phoenix-blend-pool:circuit"
+
+[profile.release]
+opt-level = "s"
+lto = true

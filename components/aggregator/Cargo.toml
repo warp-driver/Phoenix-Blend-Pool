@@ -1,0 +1,20 @@
+[package]
+name = "blend-rebalance-aggregator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0.100"
+stellar-strkey = "0.0.13"
+wit-bindgen = "0.53.1"
+
+[package.metadata.component]
+package = "phoenix-blend-pool:aggregator"
+
+[profile.release]
+opt-level = "s"
+lto = true

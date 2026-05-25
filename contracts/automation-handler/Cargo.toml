@@ -1,0 +1,22 @@
+[package]
+name = "automation-handler"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { version = "26", features = ["alloc"] }
+warpdrive-shared = "0.2.4"
+
+[dev-dependencies]
+soroban-sdk = { version = "26", features = ["testutils"] }
+warpdrive-shared = { version = "0.2.4", features = ["testutils"] }
+ed25519-verification = { path = "../ed25519-verification" }
+ed25519-security = { path = "../ed25519-security" }
+
+[profile.release]
+overflow-checks = true

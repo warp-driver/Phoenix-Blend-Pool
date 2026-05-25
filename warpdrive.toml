@@ -1,0 +1,59 @@
+# Warpdrive node config for phoenix-blend-pool.
+#
+# Watches Phoenix XLM-USDC (blended-pool variant) swaps on stellar:pubnet,
+# signs envelopes with the operator's HD-derived ed25519 key, and submits via
+# quorum to the automation-handler on stellar:testnet (move to :pubnet for
+# real mainnet).
+#
+# This file lives on each operator's box at the deploy root. The only
+# per-operator difference is the `[warpdrive.p2p.remote]` block — see below.
+
+[default]
+log_level = ["info", "warpdrive=debug"]
+
+[default.chains.stellar.pubnet]
+chain_poll_interval_ms = 5000
+rpc_url = "https://mainnet.sorobanrpc.com"
+network_passphrase = "Public Global Stellar Network ; September 2015"
+
+[default.chains.stellar.testnet]
+chain_poll_interval_ms = 5000
+rpc_url = "https://soroban-testnet.stellar.org"
+network_passphrase = "Test SDF Network ; September 2015"
+friendbot_url = "https://friendbot-testnet.stellar.org/"
+
+[warpdrive]
+port = 8000
+dev_endpoints_enabled = true
+ipfs_gateway = "https://gateway.pinata.cloud/ipfs/"
+host = "0.0.0.0"
+
+# ── P2P ────────────────────────────────────────────────────────────────
+# Per-operator config. Production target: 5-7 operators (per
+# PHOENIX_BLEND_AUTOMATION.md), quorum 4-of-5 or 5-of-7.
+#
+# operator-1 (bootstrap, this default):
+[warpdrive.p2p.remote]
+listen_port = 9000
+bootstrap_nodes = []
+#
+# operator-N (N >= 2): replace the section above with explicit bootstrap_nodes:
+#
+# [warpdrive.p2p.remote]
+# listen_port = 9000
+# bootstrap_nodes = [
+#     "/ip4/<operator-1-ip>/tcp/9000/p2p/<operator-1-peer-id>",
+# ]
+
+[cli]
+
+[cli.chains.stellar.pubnet]
+chain_poll_interval_ms = 5000
+rpc_url = "https://mainnet.sorobanrpc.com"
+network_passphrase = "Public Global Stellar Network ; September 2015"
+
+[cli.chains.stellar.testnet]
+chain_poll_interval_ms = 5000
+rpc_url = "https://soroban-testnet.stellar.org"
+network_passphrase = "Test SDF Network ; September 2015"
+friendbot_url = "https://friendbot-testnet.stellar.org/"
