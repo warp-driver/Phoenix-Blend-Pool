@@ -4,23 +4,26 @@ WarpDrive-driven rebalance automation for the Phoenix XLM-USDC "blended" pool va
 
 ## What it does (v1)
 
-1. The **circuit** (`components/circuit/`) subscribes to `swap` events on the blended pool. When the pool gains USDC (a trader sold USDC into it), the circuit emits a `RebalanceToBlend { amount_usdc }` payload sized at 10% of the inbound USDC.
-2. WarpDrive operators sign the envelope; the **aggregator** (`components/aggregator/`) submits it once quorum is reached.
-3. The **automation-handler** (`contracts/automation-handler/`) on Stellar:
-   - Verifies the quorum signature via the vendored `ed25519-verification` contract.
-   - Reads the blended pool's logical reserves via `query_delegate_state()`.
-   - Withdraws `amount_usdc` USDC + the proportional XLM amount from the blended pool (via `withdraw_to_delegate`), keeping the new pool's physical XLM:USDC ratio steady.
-   - Swaps the XLM leg through the legacy Phoenix XLM-USDC pool to obtain more USDC.
-   - Supplies the combined USDC to a Blend USDC lending pool via `submit(Supply)`.
+The circuit (`components/circuit/`) subscribes to `swap` events on the blended pool. On each finalized swap, it inspects the direction and emits a `RebalanceAction` payload sized at 10% of the swap's USDC volume:
+
+- **Pool gained USDC** (trader sold USDC in) → emit `ToBlend(amount_usdc)`.
+- **Pool lost USDC** (trader bought USDC out) → emit `FromBlend(amount_usdc)`.
+
+WarpDrive operators sign the envelope; the **aggregator** (`components/aggregator/`) submits it once quorum is reached. The **automation-handler** (`contracts/automation-handler/`) on Stellar verifies the quorum signature via the vendored `ed25519-verification` contract, dedupes by `event_id`, then dispatches:
+
+- **`ToBlend(amount_usdc)`** — withdraws `amount_usdc` USDC + the proportional XLM amount from the blended pool (via `withdraw_to_delegate`), keeping the new pool's physical XLM:USDC ratio steady. Swaps the XLM leg through the legacy Phoenix XLM-USDC pool. Supplies the combined USDC to the Blend lending pool via `submit(Supply)`.
+
+- **`FromBlend(amount_usdc)`** — withdraws `amount_usdc` USDC from Blend via `submit(Withdraw)`. Splits half/half: deposits one half directly as USDC, swaps the other half on the legacy pool for XLM, then deposits both legs back into the blended pool via `deposit_from_delegate`. The pool's DelegatedOutA and DelegatedOutB both decrement.
 
 The handler is the address that gets configured as the blended pool's delegate via `set_delegate(...)`.
 
 ## What it does NOT do (yet)
 
-- The reverse direction (pull from Blend back into the pool when liquid USDC runs low).
 - BLND emission harvesting + swap-and-donate of yield.
-- A real drift-vs-target trigger (the current v1 logic is "emit 10% of every USDC-in swap"; production should compare current liquid ratio against a 50% target).
+- A real drift-vs-target trigger (current v1 logic is "emit 10% of every USDC-touching swap"; production should compare current liquid ratio against a 50% target).
+- Cooldown between rebalances (currently fires on every relevant swap).
 - Multi-operator deploy beyond a single dev node.
+- Integration tests against mocked Blend / legacy pool / blended pool (placeholder stub in `tests.rs`).
 
 ## Layout
 

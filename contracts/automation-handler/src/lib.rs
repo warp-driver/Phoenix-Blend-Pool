@@ -8,5 +8,5 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
-pub use contract::{AutomationHandler, AutomationHandlerClient, RebalanceToBlend};
+pub use contract::{AutomationHandler, AutomationHandlerClient, RebalanceAction};
 pub use warpdrive_shared::interfaces::handler::{Ed25519SignatureData, HandlerError};

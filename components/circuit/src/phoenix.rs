@@ -65,29 +65,41 @@ pub fn apply(state: &mut SwapState, update: FieldUpdate) {
     }
 }
 
-/// Decide whether this swap should trigger a RebalanceToBlend, and if so
-/// return the `amount_usdc` to emit.
+/// Decide whether this swap should trigger a rebalance, and if so return
+/// the direction + `amount_usdc` to emit.
 ///
-/// v1 trigger: emit only when the pool *gained* USDC (trader sold USDC into
-/// the pool). The rebalance amount is a fixed 10% of the inbound USDC.
-/// Intentionally crude — production logic would compare current reserves
-/// against a 50% target via an RPC read or a heartbeat trigger. For the
-/// first slice we just need the pipeline to fire end-to-end.
-pub fn try_finalize(state: &SwapState) -> Option<i128> {
+/// v1 trigger: emit 10% of the swap's USDC volume in whichever direction
+/// the pool experienced. Intentionally crude — production logic would
+/// compare current reserves against a 50% target via RPC. For the first
+/// slice we just need the pipeline to fire end-to-end in both directions.
+pub fn try_finalize(state: &SwapState) -> Option<RebalanceEmit> {
     let sell_token = state.sell_token.as_ref()?;
     let buy_token = state.buy_token.as_ref()?;
     let offer_amount = state.offer_amount?;
-    let _return_amount = state.return_amount?;
+    let return_amount = state.return_amount?;
 
     if sell_token == USDC_SAC_CONTRACT_ID {
+        // Trader sold USDC into the pool. Pool's liquid USDC went UP. Push
+        // some of the excess into Blend.
         let amount = offer_amount / 10;
         if amount > 0 {
-            return Some(amount);
+            return Some(RebalanceEmit::ToBlend(amount));
+        }
+    } else if buy_token == USDC_SAC_CONTRACT_ID {
+        // Trader bought USDC out of the pool. Pool's liquid USDC went DOWN.
+        // Pull some USDC back from Blend to top it up.
+        let amount = return_amount / 10;
+        if amount > 0 {
+            return Some(RebalanceEmit::FromBlend(amount));
         }
     }
-    // Pool lost USDC (or swap didn't involve USDC at all). No rebalance.
-    let _ = buy_token;
     None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebalanceEmit {
+    ToBlend(i128),
+    FromBlend(i128),
 }
 
 fn decode_address_strkey(val: &ScVal) -> Result<String> {

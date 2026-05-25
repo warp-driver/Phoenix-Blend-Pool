@@ -1,76 +1,78 @@
-use crate::payload;
+use crate::payload::{self, Direction};
 use crate::phoenix::{
-    apply, decode_field, try_finalize, FieldUpdate, SwapState, USDC_SAC_CONTRACT_ID,
+    apply, decode_field, try_finalize, FieldUpdate, RebalanceEmit, SwapState, USDC_SAC_CONTRACT_ID,
 };
 use std::str::FromStr;
 use stellar_xdr::curr::{
     Int128Parts, Limits, ReadXdr, ScAddress, ScString, ScSymbol, ScVal, StringM, WriteXdr,
 };
 
-#[test]
-fn payload_encodes_as_scmap_with_single_amount_entry() {
-    let amount: i128 = 1_000_0000000; // 1000 USDC, 7 decimals
-    let bytes = payload::encode(amount).unwrap();
-
-    let decoded = ScVal::from_xdr(&bytes, Limits::none()).unwrap();
-    let entries = match decoded {
-        ScVal::Map(Some(m)) => m.0.to_vec(),
-        other => panic!("expected ScMap, got {other:?}"),
+fn decode_envelope_payload(bytes: &[u8]) -> (String, i128) {
+    let decoded = ScVal::from_xdr(bytes, Limits::none()).unwrap();
+    let elements = match decoded {
+        ScVal::Vec(Some(v)) => v.0.to_vec(),
+        other => panic!("expected ScVec, got {other:?}"),
     };
-    assert_eq!(entries.len(), 1);
+    assert_eq!(elements.len(), 2, "enum payload = [tag, amount]");
 
-    let amount_sym = ScSymbol("amount_usdc".try_into().unwrap());
-    assert_eq!(entries[0].key, ScVal::Symbol(amount_sym));
-
-    match &entries[0].val {
-        ScVal::I128(Int128Parts { hi, lo }) => {
-            let recombined = ((*hi as i128) << 64) | (*lo as u128 as i128);
-            assert_eq!(recombined, amount);
-        }
+    let tag = match &elements[0] {
+        ScVal::Symbol(ScSymbol(s)) => s.to_string(),
+        other => panic!("expected tag Symbol, got {other:?}"),
+    };
+    let amount = match &elements[1] {
+        ScVal::I128(Int128Parts { hi, lo }) => ((*hi as i128) << 64) | (*lo as u128 as i128),
         other => panic!("expected I128, got {other:?}"),
-    }
+    };
+    (tag, amount)
 }
 
 #[test]
-fn payload_encodes_negative_amounts_too() {
-    // We never expect negatives in production (the handler rejects amount_usdc
-    // <= 0) but the encoder should still produce well-formed XDR.
-    let amount: i128 = -42_i128;
-    let bytes = payload::encode(amount).unwrap();
-    let decoded = ScVal::from_xdr(&bytes, Limits::none()).unwrap();
-    match decoded {
-        ScVal::Map(Some(m)) => {
-            let parts = match &m.0.to_vec()[0].val {
-                ScVal::I128(p) => p.clone(),
-                _ => panic!(),
-            };
-            let recombined = ((parts.hi as i128) << 64) | (parts.lo as u128 as i128);
-            assert_eq!(recombined, amount);
-        }
-        _ => panic!(),
-    }
+fn payload_encodes_to_blend_variant() {
+    let amount: i128 = 1_000_0000000;
+    let bytes = payload::encode(Direction::ToBlend, amount).unwrap();
+    let (tag, decoded_amount) = decode_envelope_payload(&bytes);
+    assert_eq!(tag, "ToBlend");
+    assert_eq!(decoded_amount, amount);
 }
 
 #[test]
-fn finalize_emits_on_usdc_sale_into_pool() {
+fn payload_encodes_from_blend_variant() {
+    let amount: i128 = 250_0000000;
+    let bytes = payload::encode(Direction::FromBlend, amount).unwrap();
+    let (tag, decoded_amount) = decode_envelope_payload(&bytes);
+    assert_eq!(tag, "FromBlend");
+    assert_eq!(decoded_amount, amount);
+}
+
+#[test]
+fn payload_roundtrips_negative_amounts() {
+    // Production reject negatives at the handler; encoder still produces
+    // well-formed XDR (we don't want silent corruption).
+    let bytes = payload::encode(Direction::ToBlend, -1).unwrap();
+    let (tag, decoded) = decode_envelope_payload(&bytes);
+    assert_eq!(tag, "ToBlend");
+    assert_eq!(decoded, -1);
+}
+
+#[test]
+fn finalize_emits_to_blend_on_usdc_sold_into_pool() {
     let mut s = SwapState::default();
     apply(&mut s, FieldUpdate::SellToken(USDC_SAC_CONTRACT_ID.into()));
-    apply(&mut s, FieldUpdate::BuyToken("CXLMPLACEHOLDER".into()));
-    apply(&mut s, FieldUpdate::OfferAmount(1_000_0000000)); // 1000 USDC
-    assert!(try_finalize(&s).is_none(), "not finalized until return arrives");
+    apply(&mut s, FieldUpdate::BuyToken("CXLM_PLACEHOLDER".into()));
+    apply(&mut s, FieldUpdate::OfferAmount(1_000_0000000));
+    assert!(try_finalize(&s).is_none(), "not finalized until both amounts arrive");
     apply(&mut s, FieldUpdate::ReturnAmount(2_500_0000000));
-    // 10% of inbound USDC
-    assert_eq!(try_finalize(&s), Some(100_0000000));
+    assert_eq!(try_finalize(&s), Some(RebalanceEmit::ToBlend(100_0000000)));
 }
 
 #[test]
-fn finalize_returns_none_when_pool_loses_usdc() {
+fn finalize_emits_from_blend_on_usdc_bought_out_of_pool() {
     let mut s = SwapState::default();
-    apply(&mut s, FieldUpdate::SellToken("CXLM".into()));
+    apply(&mut s, FieldUpdate::SellToken("CXLM_PLACEHOLDER".into()));
     apply(&mut s, FieldUpdate::BuyToken(USDC_SAC_CONTRACT_ID.into()));
     apply(&mut s, FieldUpdate::OfferAmount(2_500_0000000));
     apply(&mut s, FieldUpdate::ReturnAmount(1_000_0000000));
-    assert_eq!(try_finalize(&s), None);
+    assert_eq!(try_finalize(&s), Some(RebalanceEmit::FromBlend(100_0000000)));
 }
 
 #[test]
@@ -95,10 +97,7 @@ fn finalize_skips_dust_swaps() {
 }
 
 #[test]
-fn decode_real_phoenix_event_shape() {
-    // Synthetic data mirroring the on-chain event format: 5 events for one
-    // logical swap. Trader sells USDC into the pool; circuit should emit a
-    // RebalanceToBlend payload.
+fn decode_real_phoenix_event_shape_forward() {
     let xlm = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA";
     let usdc = USDC_SAC_CONTRACT_ID;
 
@@ -115,7 +114,28 @@ fn decode_real_phoenix_event_shape() {
         apply(&mut state, update);
     }
 
-    assert_eq!(try_finalize(&state), Some(100_0000000));
+    assert_eq!(try_finalize(&state), Some(RebalanceEmit::ToBlend(100_0000000)));
+}
+
+#[test]
+fn decode_real_phoenix_event_shape_reverse() {
+    let xlm = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA";
+    let usdc = USDC_SAC_CONTRACT_ID;
+
+    let events = [
+        (string_topic("swap"), string_topic("sell_token"), addr_value(xlm)),
+        (string_topic("swap"), string_topic("offer_amount"), i128_value(2_500_0000000)),
+        (string_topic("swap"), string_topic("buy_token"), addr_value(usdc)),
+        (string_topic("swap"), string_topic("return_amount"), i128_value(1_000_0000000)),
+    ];
+
+    let mut state = SwapState::default();
+    for (t0, t1, v) in &events {
+        let update = decode_field(&[t0.clone(), t1.clone()], v).unwrap();
+        apply(&mut state, update);
+    }
+
+    assert_eq!(try_finalize(&state), Some(RebalanceEmit::FromBlend(100_0000000)));
 }
 
 fn string_topic(s: &str) -> String {

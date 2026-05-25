@@ -69,6 +69,7 @@ pub struct BlendPositions {
 }
 
 pub const BLEND_REQUEST_SUPPLY: u32 = 0;
+pub const BLEND_REQUEST_WITHDRAW: u32 = 1;
 
 #[contractclient(name = "BlendPoolClient")]
 pub trait BlendPool {

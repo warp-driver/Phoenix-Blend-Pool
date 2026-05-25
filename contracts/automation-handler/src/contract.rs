@@ -8,20 +8,29 @@ use warpdrive_shared::interfaces::{
 
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, LegacyPoolClient, BLEND_REQUEST_SUPPLY,
+    BLEND_REQUEST_WITHDRAW,
 };
 use crate::storage;
 
 /// Payload encoded inside the XlmEnvelope by the off-chain circuit + quorum.
 ///
-/// `amount_usdc` is the USDC amount to withdraw from the blended pool. The
-/// handler computes the matching XLM withdrawal from the pool's current
-/// logical reserves at execution time (preserving the pool's physical
-/// XLM:USDC ratio), swaps that XLM through the legacy XLM-USDC Phoenix pool,
-/// and supplies the combined USDC to Blend.
+/// Two directions:
+///
+/// - `ToBlend(amount_usdc)` — forward rebalance. `amount_usdc` is the direct
+///   USDC pull from the blended pool. The handler also pulls the
+///   proportional XLM, swaps it on the legacy pool, and supplies the
+///   combined ~2 * amount_usdc USDC into Blend.
+///
+/// - `FromBlend(amount_usdc)` — reverse rebalance. `amount_usdc` is the
+///   total USDC withdrawn from Blend; the handler splits it half-and-half,
+///   swaps one half on the legacy pool for XLM, and returns both legs to the
+///   blended pool via `deposit_from_delegate`. Net effect: pool's
+///   DelegatedOutA and DelegatedOutB both decrement.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RebalanceToBlend {
-    pub amount_usdc: i128,
+pub enum RebalanceAction {
+    ToBlend(i128),
+    FromBlend(i128),
 }
 
 #[contract]
@@ -50,10 +59,7 @@ impl AutomationHandler {
     }
 
     /// Quorum-signed entrypoint. Verifies the envelope, decodes a
-    /// RebalanceToBlend action, and dispatches the cycle:
-    ///   1. Pull `amount_usdc` USDC + proportional XLM from the blended pool
-    ///   2. Swap the XLM on the legacy pool for USDC
-    ///   3. Supply the combined USDC to Blend
+    /// `RebalanceAction`, and dispatches forward or reverse.
     pub fn verify_xlm(
         env: Env,
         envelope_bytes: Bytes,
@@ -80,14 +86,23 @@ impl AutomationHandler {
             Err(Err(_)) => return Err(HandlerError::OtherInvocationError),
         }
 
-        let payload = RebalanceToBlend::from_xdr(&env, &envelope.payload)
+        let action = RebalanceAction::from_xdr(&env, &envelope.payload)
             .map_err(|_| HandlerError::InvalidEnvelope)?;
 
-        if payload.amount_usdc <= 0 {
-            return Err(HandlerError::InvalidEnvelope);
+        match action {
+            RebalanceAction::ToBlend(amount_usdc) => {
+                if amount_usdc <= 0 {
+                    return Err(HandlerError::InvalidEnvelope);
+                }
+                execute_to_blend(&env, amount_usdc)?;
+            }
+            RebalanceAction::FromBlend(amount_usdc) => {
+                if amount_usdc <= 0 {
+                    return Err(HandlerError::InvalidEnvelope);
+                }
+                execute_from_blend(&env, amount_usdc)?;
+            }
         }
-
-        execute_rebalance(&env, payload.amount_usdc)?;
 
         storage::mark_event_seen(&env, &event_id);
         storage::extend_instance_ttl(&env);
@@ -116,7 +131,11 @@ impl AutomationHandler {
     }
 }
 
-fn execute_rebalance(env: &Env, amount_usdc: i128) -> Result<(), HandlerError> {
+/// Forward direction: pool -> Blend.
+///
+/// Pulls `amount_usdc` directly + proportional XLM, swaps XLM to USDC on
+/// the legacy pool, supplies combined USDC to Blend.
+fn execute_to_blend(env: &Env, amount_usdc: i128) -> Result<(), HandlerError> {
     let blended_pool = storage::get_blended_pool(env);
     let legacy_pool = storage::get_legacy_pool(env);
     let blend_pool = storage::get_blend_pool(env);
@@ -124,25 +143,12 @@ fn execute_rebalance(env: &Env, amount_usdc: i128) -> Result<(), HandlerError> {
     let xlm = storage::get_xlm(env);
 
     let pool_client = BlendedPoolClient::new(env, &blended_pool);
-    let state = pool_client.query_delegate_state();
-
-    // The blended pool stores reserves as (a, b) where token_a < token_b by
-    // Address sort. Identify which slot is USDC vs XLM.
-    let (total_usdc, total_xlm) = if usdc < xlm {
-        (state.total_a, state.total_b)
-    } else {
-        (state.total_b, state.total_a)
-    };
-    if total_usdc <= 0 || total_xlm <= 0 {
-        return Err(HandlerError::InvalidEnvelope);
-    }
+    let (total_usdc, total_xlm) = pool_reserves(&pool_client, &usdc, &xlm)?;
 
     // Proportional XLM pull to keep the new pool's physical ratio steady:
     //   amount_xlm / amount_usdc == total_xlm / total_usdc
     let amount_xlm = mul_div(amount_usdc, total_xlm, total_usdc)?;
 
-    // Pull both legs from the blended pool. The handler is the registered
-    // delegate, so the pool transfers tokens directly to this contract.
     pool_client.withdraw_to_delegate(&xlm, &amount_xlm);
     pool_client.withdraw_to_delegate(&usdc, &amount_usdc);
 
@@ -163,15 +169,95 @@ fn execute_rebalance(env: &Env, amount_usdc: i128) -> Result<(), HandlerError> {
         .checked_add(swapped_usdc)
         .ok_or(HandlerError::OtherInvocationError)?;
 
-    // Supply combined USDC to Blend. Handler is `from` (position holder),
-    // `spender` (token source), and `to` (any outbound tokens if Blend ever
-    // routes some back, e.g. via dust accounting).
-    let blend = BlendPoolClient::new(env, &blend_pool);
+    blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, total_supply);
+    Ok(())
+}
+
+/// Reverse direction: Blend -> pool.
+///
+/// `amount_usdc` is the total USDC to withdraw from Blend. Half lands as USDC
+/// back in the blended pool; the other half gets swapped on the legacy pool
+/// to XLM and lands as XLM. The pool's DelegatedOutA and DelegatedOutB both
+/// decrease accordingly.
+fn execute_from_blend(env: &Env, amount_usdc: i128) -> Result<(), HandlerError> {
+    let blended_pool = storage::get_blended_pool(env);
+    let legacy_pool = storage::get_legacy_pool(env);
+    let blend_pool = storage::get_blend_pool(env);
+    let usdc = storage::get_usdc(env);
+    let xlm = storage::get_xlm(env);
+
+    let pool_client = BlendedPoolClient::new(env, &blended_pool);
+    // We don't need exact reserves for the split — half/half by USDC value
+    // gives the pool back equal value on each side. But we DO read state to
+    // bail early if the pool has no logical reserves yet (the math below
+    // would panic in deposit_from_delegate when it tries to underflow
+    // DelegatedOut counters that aren't positive).
+    let (total_usdc, total_xlm) = pool_reserves(&pool_client, &usdc, &xlm)?;
+    let _ = (total_usdc, total_xlm);
+
+    let half = amount_usdc / 2;
+    let other_half = amount_usdc
+        .checked_sub(half)
+        .ok_or(HandlerError::OtherInvocationError)?;
+    if half <= 0 || other_half <= 0 {
+        return Err(HandlerError::InvalidEnvelope);
+    }
+
+    // Pull combined USDC out of Blend in one call.
+    blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, amount_usdc);
+
+    // Swap `half` USDC for XLM on legacy. The returned amount is whatever
+    // the legacy pool's spot price gives us (legacy pool may have its own
+    // ratio drift after the swap).
+    let legacy = LegacyPoolClient::new(env, &legacy_pool);
+    let xlm_received = legacy.swap(
+        &env.current_contract_address(),
+        &usdc,
+        &half,
+        &None::<i128>,
+        &Some(10_000i64),
+        &None::<u64>,
+        &None::<i64>,
+    );
+
+    // Push both legs back into the blended pool. The handler is the
+    // registered delegate, so the pool decrements DelegatedOut accordingly.
+    pool_client.deposit_from_delegate(&usdc, &other_half);
+    pool_client.deposit_from_delegate(&xlm, &xlm_received);
+
+    Ok(())
+}
+
+fn pool_reserves(
+    pool_client: &BlendedPoolClient,
+    usdc: &soroban_sdk::Address,
+    xlm: &soroban_sdk::Address,
+) -> Result<(i128, i128), HandlerError> {
+    let state = pool_client.query_delegate_state();
+    let (total_usdc, total_xlm) = if usdc < xlm {
+        (state.total_a, state.total_b)
+    } else {
+        (state.total_b, state.total_a)
+    };
+    if total_usdc <= 0 || total_xlm <= 0 {
+        return Err(HandlerError::InvalidEnvelope);
+    }
+    Ok((total_usdc, total_xlm))
+}
+
+fn blend_submit(
+    env: &Env,
+    blend_pool: &soroban_sdk::Address,
+    token: &soroban_sdk::Address,
+    request_type: u32,
+    amount: i128,
+) {
+    let blend = BlendPoolClient::new(env, blend_pool);
     let mut requests: Vec<BlendRequest> = Vec::new(env);
     requests.push_back(BlendRequest {
-        request_type: BLEND_REQUEST_SUPPLY,
-        address: usdc,
-        amount: total_supply,
+        request_type,
+        address: token.clone(),
+        amount,
     });
     blend.submit(
         &env.current_contract_address(),
@@ -179,8 +265,6 @@ fn execute_rebalance(env: &Env, amount_usdc: i128) -> Result<(), HandlerError> {
         &env.current_contract_address(),
         &requests,
     );
-
-    Ok(())
 }
 
 /// Saturating-checked `a * b / c`.
