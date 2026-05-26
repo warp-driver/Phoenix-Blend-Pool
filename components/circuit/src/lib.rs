@@ -1,6 +1,5 @@
 mod payload;
 mod phoenix;
-mod state;
 
 #[cfg(test)]
 mod tests;
@@ -32,25 +31,11 @@ fn run_inner(trigger_action: TriggerAction) -> anyhow::Result<Vec<WasmResponse>>
 fn handle_pool_event(
     event: warpdrive::types::chain::StellarEvent,
 ) -> anyhow::Result<Vec<WasmResponse>> {
-    // Cheap topic filter first. The node wakes us on every event from the
-    // pool (rest-wildcard on the trigger), so most invocations are not
-    // ones we care about (delegate-emitted events from our own actions,
-    // admin events, etc.).
+    // Filter topic[0]. The blended pool fork emits one event per logical
+    // action (swap / provide_liquidity / withdraw_liquidity), each with a
+    // unique tx_hash:op_index, so no per-tx dedup is needed at this layer.
+    // The handler on-chain still dedupes by event_id as defence in depth.
     if !phoenix::is_relevant_event(&event.topic_segments)? {
-        return Ok(vec![]);
-    }
-
-    // tx_hash:op_index is the canonical dedup unit. Phoenix fires many
-    // events per logical pool action (swap, provide_liquidity,
-    // withdraw_liquidity), all sharing this id. The CAS tombstone gates
-    // emission to exactly one Rebalance tick per logical action.
-    let key = format!(
-        "{}:{}",
-        event.transaction_hash,
-        event.operation_index.unwrap_or(0)
-    );
-
-    if !state::mark_if_unseen(&key)? {
         return Ok(vec![]);
     }
 

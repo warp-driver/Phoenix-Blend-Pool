@@ -4,7 +4,7 @@ WarpDrive-driven rebalance automation for the Phoenix XLM-USDC "blended" pool va
 
 ## What it does
 
-The circuit (`components/circuit/`) subscribes to all events from the blended pool (rest-wildcard trigger). At the circuit it filters topic[0] to the three event families that move the pool's liquid USDC ratio - `swap`, `provide_liquidity`, `withdraw_liquidity` - and dedupes per `tx_hash:op_index` via a wasi:keyvalue/atomics tombstone so each logical action produces exactly one `Rebalance` tick. The payload is a bare unit variant: no amount, no direction.
+The circuit (`components/circuit/`) subscribes to all events from the blended pool (rest-wildcard trigger). The blended-pool fork emits exactly one event per logical action; the circuit filters topic[0] to the three families that move the pool's liquid USDC ratio - `swap`, `provide_liquidity`, `withdraw_liquidity` - and emits one `Rebalance` tick per match. The payload is a bare unit variant: no amount, no direction. No circuit-side KV state is kept; the handler is the source of truth and dedupes on-chain by `event_id`.
 
 WarpDrive operators sign the envelope; the **aggregator** (`components/aggregator/`) submits it once quorum is reached. The **automation-handler** (`contracts/automation-handler/`) on Stellar verifies the quorum signature via the vendored `ed25519-verification` contract, dedupes by `event_id`, then runs one of two actions:
 
@@ -41,7 +41,6 @@ The service deploys **two workflows** sharing the same circuit + aggregator wasm
 - Cooldown between rebalances (currently fires on every relevant pool action whose drift breaches the band).
 - Multi-operator deploy beyond a single dev node.
 - Integration tests against mocked Blend / blended pool (placeholder stub in `contracts/automation-handler/src/tests.rs`).
-- KV tombstone garbage collection (see CLAUDE.md note on finalized-tombstone GC).
 
 ## Layout
 

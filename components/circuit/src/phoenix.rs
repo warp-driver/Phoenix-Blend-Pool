@@ -1,20 +1,21 @@
 //! Topic filter for the blended-pool event stream.
 //!
-//! WarpDrive triggers wake the circuit on EVERY event the blended pool emits
-//! (we filter with rest-wildcard on the node side so we don't miss a topic).
-//! This module decides whether a given event should result in a Rebalance
-//! tick. Three event families move the pool's liquid USDC ratio:
+//! WarpDrive triggers wake the circuit on every event the blended pool
+//! emits (rest-wildcard on the trigger side). The fork emits exactly ONE
+//! event per logical action; this module decides whether that action is
+//! one that moves the pool's liquid USDC ratio:
 //!
-//!   - `swap` ........... trader exchanges XLM<>USDC, both sides change.
-//!   - `provide_liquidity` LP deposits raise both liquid USDC and total USDC,
-//!                        but the ratio can drift up (toward 100% liquid).
-//!   - `withdraw_liquidity` LP redeem pays out from physical balance using a
-//!                        share_ratio applied to LOGICAL reserves; this can
-//!                        drain liquid USDC even at fair share when some of
-//!                        the USDC is parked in Blend. Must rebalance.
+//!   - `swap`               trader exchanges XLM/USDC; both sides change.
+//!   - `provide_liquidity`  LP deposit raises liquid + total USDC; ratio
+//!                          drifts toward 100% liquid.
+//!   - `withdraw_liquidity` LP redeem pays out from physical balance using
+//!                          a share_ratio applied to LOGICAL reserves; this
+//!                          can drain liquid USDC even at fair share when
+//!                          some of the USDC is parked in Blend. Must
+//!                          rebalance to top up.
 //!
-//! Everything else (delegate-side events, admin events) is our own action or
-//! out of scope. We ignore it to avoid spurious wake-ups.
+//! Everything else (delegate-side events from our own actions, admin
+//! events, ERC-20-style transfer/mint/burn) is ignored.
 
 use anyhow::{Context, Result};
 use stellar_xdr::curr::{Limits, ReadXdr, ScSymbol, ScVal};
