@@ -46,23 +46,21 @@ fn handle_swap_event(
     // if THIS invocation is the one that completed the SwapState and flipped
     // `finalized` true. wasi:keyvalue/atomics makes the read-modify-write
     // safe under the 8 concurrent events Phoenix fires per swap.
-    let to_emit = state::update_with(&key, |s| {
+    // CAS-update the per-swap accumulator. Returns true if THIS invocation
+    // is the one that completed the SwapState and flipped `finalized`.
+    // wasi:keyvalue/atomics makes the read-modify-write safe under the 8
+    // concurrent events Phoenix fires per swap.
+    let should_emit = state::update_with(&key, |s| {
         phoenix::apply(s, update.clone());
-        if !s.finalized {
-            if let Some(emit) = phoenix::try_finalize(s) {
-                s.finalized = true;
-                return Some(emit);
-            }
+        if !s.finalized && phoenix::try_finalize(s) {
+            s.finalized = true;
+            return true;
         }
-        None
+        false
     })?;
 
-    if let Some(emit) = to_emit {
-        let (direction, amount) = match emit {
-            phoenix::RebalanceEmit::ToBlend(a) => (payload::Direction::ToBlend, a),
-            phoenix::RebalanceEmit::FromBlend(a) => (payload::Direction::FromBlend, a),
-        };
-        let bytes = payload::encode(direction, amount)?;
+    if should_emit {
+        let bytes = payload::encode(payload::Direction::Rebalance)?;
         return Ok(vec![WasmResponse {
             payload: bytes,
             ordering: None,
@@ -77,7 +75,7 @@ fn handle_swap_event(
 /// "harvest now" instruction, and the framework assigns a unique event_id
 /// per cron firing so the handler dedupes naturally.
 fn harvest_yield_response() -> anyhow::Result<WasmResponse> {
-    let bytes = payload::encode(payload::Direction::HarvestYield, 0)?;
+    let bytes = payload::encode(payload::Direction::HarvestYield)?;
     Ok(WasmResponse {
         payload: bytes,
         ordering: None,

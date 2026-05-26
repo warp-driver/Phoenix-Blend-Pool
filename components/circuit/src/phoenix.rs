@@ -2,10 +2,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use stellar_xdr::curr::{Limits, ReadXdr, ScSymbol, ScVal};
 
-// USDC Stellar Asset Contract on mainnet. The blended pool we integrate
-// with is XLM-USDC; this is the side we ultimately move into Blend.
-//
-// Source: blend-contracts-v2/test-suites/src/snapshot.rs USDC_ID.
+// USDC Stellar Asset Contract on mainnet. Used to filter swap events down to
+// USDC-touching ones (in an XLM-USDC pool this is every swap, but the check
+// stays as a defensive guard if the trigger ever gets pointed at a non-USDC
+// pool by mistake).
 pub const USDC_SAC_CONTRACT_ID: &str =
     "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75";
 
@@ -65,41 +65,25 @@ pub fn apply(state: &mut SwapState, update: FieldUpdate) {
     }
 }
 
-/// Decide whether this swap should trigger a rebalance, and if so return
-/// the direction + `amount_usdc` to emit.
+/// Decide whether this finalized SwapState should trigger a Rebalance tick.
 ///
-/// v1 trigger: emit 10% of the swap's USDC volume in whichever direction
-/// the pool experienced. Intentionally crude — production logic would
-/// compare current reserves against a 50% target via RPC. For the first
-/// slice we just need the pipeline to fire end-to-end in both directions.
-pub fn try_finalize(state: &SwapState) -> Option<RebalanceEmit> {
-    let sell_token = state.sell_token.as_ref()?;
-    let buy_token = state.buy_token.as_ref()?;
-    let offer_amount = state.offer_amount?;
-    let return_amount = state.return_amount?;
-
-    if sell_token == USDC_SAC_CONTRACT_ID {
-        // Trader sold USDC into the pool. Pool's liquid USDC went UP. Push
-        // some of the excess into Blend.
-        let amount = offer_amount / 10;
-        if amount > 0 {
-            return Some(RebalanceEmit::ToBlend(amount));
-        }
-    } else if buy_token == USDC_SAC_CONTRACT_ID {
-        // Trader bought USDC out of the pool. Pool's liquid USDC went DOWN.
-        // Pull some USDC back from Blend to top it up.
-        let amount = return_amount / 10;
-        if amount > 0 {
-            return Some(RebalanceEmit::FromBlend(amount));
-        }
+/// We don't compute amount or direction here — the on-chain handler does that
+/// against authoritative `query_delegate_state`. The circuit's only job is
+/// exactly-once delivery: one Rebalance per logical swap, where Phoenix
+/// fires 8 events per swap. The CAS-folded `SwapState` finalizes once all
+/// four canonical fields (sell/buy token + offer/return amount) are present;
+/// at that point we emit if either side of the swap was USDC.
+pub fn try_finalize(state: &SwapState) -> bool {
+    let Some(sell_token) = state.sell_token.as_ref() else {
+        return false;
+    };
+    let Some(buy_token) = state.buy_token.as_ref() else {
+        return false;
+    };
+    if state.offer_amount.is_none() || state.return_amount.is_none() {
+        return false;
     }
-    None
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RebalanceEmit {
-    ToBlend(i128),
-    FromBlend(i128),
+    sell_token == USDC_SAC_CONTRACT_ID || buy_token == USDC_SAC_CONTRACT_ID
 }
 
 fn decode_address_strkey(val: &ScVal) -> Result<String> {

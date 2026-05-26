@@ -1,117 +1,97 @@
 use crate::payload::{self, Direction};
-use crate::phoenix::{
-    apply, decode_field, try_finalize, FieldUpdate, RebalanceEmit, SwapState, USDC_SAC_CONTRACT_ID,
-};
+use crate::phoenix::{apply, decode_field, try_finalize, FieldUpdate, SwapState, USDC_SAC_CONTRACT_ID};
 use std::str::FromStr;
 use stellar_xdr::curr::{
     Int128Parts, Limits, ReadXdr, ScAddress, ScString, ScSymbol, ScVal, StringM, WriteXdr,
 };
 
-fn decode_envelope_payload(bytes: &[u8]) -> (String, Option<i128>) {
+/// Decode the encoded enum payload back into its tag Symbol. Both production
+/// variants are unit, so we only ever expect a single-element ScVec.
+fn decode_envelope_tag(bytes: &[u8]) -> String {
     let decoded = ScVal::from_xdr(bytes, Limits::none()).unwrap();
     let elements = match decoded {
         ScVal::Vec(Some(v)) => v.0.to_vec(),
         other => panic!("expected ScVec, got {other:?}"),
     };
-    assert!(
-        elements.len() == 1 || elements.len() == 2,
-        "enum payload is [tag] or [tag, amount]"
+    assert_eq!(
+        elements.len(),
+        1,
+        "unit-variant payload must be exactly [tag]"
     );
-
-    let tag = match &elements[0] {
+    match &elements[0] {
         ScVal::Symbol(ScSymbol(s)) => s.to_string(),
         other => panic!("expected tag Symbol, got {other:?}"),
-    };
-    let amount = if elements.len() == 2 {
-        match &elements[1] {
-            ScVal::I128(Int128Parts { hi, lo }) => {
-                Some(((*hi as i128) << 64) | (*lo as u128 as i128))
-            }
-            other => panic!("expected I128, got {other:?}"),
-        }
-    } else {
-        None
-    };
-    (tag, amount)
+    }
 }
 
 #[test]
-fn payload_encodes_to_blend_variant() {
-    let amount: i128 = 1_000_0000000;
-    let bytes = payload::encode(Direction::ToBlend, amount).unwrap();
-    let (tag, decoded_amount) = decode_envelope_payload(&bytes);
-    assert_eq!(tag, "ToBlend");
-    assert_eq!(decoded_amount, Some(amount));
-}
-
-#[test]
-fn payload_encodes_from_blend_variant() {
-    let amount: i128 = 250_0000000;
-    let bytes = payload::encode(Direction::FromBlend, amount).unwrap();
-    let (tag, decoded_amount) = decode_envelope_payload(&bytes);
-    assert_eq!(tag, "FromBlend");
-    assert_eq!(decoded_amount, Some(amount));
+fn payload_encodes_rebalance_unit_variant() {
+    let bytes = payload::encode(Direction::Rebalance).unwrap();
+    assert_eq!(decode_envelope_tag(&bytes), "Rebalance");
 }
 
 #[test]
 fn payload_encodes_harvest_yield_unit_variant() {
-    // HarvestYield carries no data; encoding should emit just [Symbol].
-    let bytes = payload::encode(Direction::HarvestYield, 0).unwrap();
-    let (tag, decoded_amount) = decode_envelope_payload(&bytes);
-    assert_eq!(tag, "HarvestYield");
-    assert_eq!(decoded_amount, None);
+    let bytes = payload::encode(Direction::HarvestYield).unwrap();
+    assert_eq!(decode_envelope_tag(&bytes), "HarvestYield");
 }
 
 #[test]
-fn payload_roundtrips_negative_amounts() {
-    // Production reject negatives at the handler; encoder still produces
-    // well-formed XDR (we don't want silent corruption).
-    let bytes = payload::encode(Direction::ToBlend, -1).unwrap();
-    let (tag, decoded) = decode_envelope_payload(&bytes);
-    assert_eq!(tag, "ToBlend");
-    assert_eq!(decoded, Some(-1));
-}
-
-#[test]
-fn finalize_emits_to_blend_on_usdc_sold_into_pool() {
+fn finalize_emits_when_usdc_sold_into_pool() {
     let mut s = SwapState::default();
     apply(&mut s, FieldUpdate::SellToken(USDC_SAC_CONTRACT_ID.into()));
     apply(&mut s, FieldUpdate::BuyToken("CXLM_PLACEHOLDER".into()));
     apply(&mut s, FieldUpdate::OfferAmount(1_000_0000000));
-    assert!(try_finalize(&s).is_none(), "not finalized until both amounts arrive");
+    assert!(!try_finalize(&s), "not finalized until both amounts arrive");
     apply(&mut s, FieldUpdate::ReturnAmount(2_500_0000000));
-    assert_eq!(try_finalize(&s), Some(RebalanceEmit::ToBlend(100_0000000)));
+    assert!(try_finalize(&s));
 }
 
 #[test]
-fn finalize_emits_from_blend_on_usdc_bought_out_of_pool() {
+fn finalize_emits_when_usdc_bought_out_of_pool() {
     let mut s = SwapState::default();
     apply(&mut s, FieldUpdate::SellToken("CXLM_PLACEHOLDER".into()));
     apply(&mut s, FieldUpdate::BuyToken(USDC_SAC_CONTRACT_ID.into()));
     apply(&mut s, FieldUpdate::OfferAmount(2_500_0000000));
     apply(&mut s, FieldUpdate::ReturnAmount(1_000_0000000));
-    assert_eq!(try_finalize(&s), Some(RebalanceEmit::FromBlend(100_0000000)));
+    assert!(try_finalize(&s));
 }
 
 #[test]
-fn finalize_returns_none_for_non_usdc_swap() {
+fn finalize_skips_non_usdc_swap() {
+    // Defensive: if the trigger ever gets pointed at a non-USDC pool,
+    // we shouldn't emit a Rebalance for it.
     let mut s = SwapState::default();
     apply(&mut s, FieldUpdate::SellToken("CFOO".into()));
     apply(&mut s, FieldUpdate::BuyToken("CBAR".into()));
     apply(&mut s, FieldUpdate::OfferAmount(100));
     apply(&mut s, FieldUpdate::ReturnAmount(99));
-    assert_eq!(try_finalize(&s), None);
+    assert!(!try_finalize(&s));
 }
 
 #[test]
-fn finalize_skips_dust_swaps() {
-    // 5 USDC base units => 0.5 after integer division => skip.
+fn finalize_skips_until_all_fields_present() {
+    let mut s = SwapState::default();
+    apply(&mut s, FieldUpdate::SellToken(USDC_SAC_CONTRACT_ID.into()));
+    assert!(!try_finalize(&s));
+    apply(&mut s, FieldUpdate::BuyToken("CXLM".into()));
+    assert!(!try_finalize(&s));
+    apply(&mut s, FieldUpdate::OfferAmount(1));
+    assert!(!try_finalize(&s));
+    apply(&mut s, FieldUpdate::ReturnAmount(1));
+    assert!(try_finalize(&s));
+}
+
+#[test]
+fn finalize_does_not_depend_on_amount_magnitude() {
+    // Dust swaps still tick — handler decides whether the drift is large
+    // enough to actually act, and applies the min_total_usdc floor too.
     let mut s = SwapState::default();
     apply(&mut s, FieldUpdate::SellToken(USDC_SAC_CONTRACT_ID.into()));
     apply(&mut s, FieldUpdate::BuyToken("CXLM".into()));
-    apply(&mut s, FieldUpdate::OfferAmount(5));
+    apply(&mut s, FieldUpdate::OfferAmount(1));
     apply(&mut s, FieldUpdate::ReturnAmount(1));
-    assert_eq!(try_finalize(&s), None);
+    assert!(try_finalize(&s));
 }
 
 #[test]
@@ -132,7 +112,7 @@ fn decode_real_phoenix_event_shape_forward() {
         apply(&mut state, update);
     }
 
-    assert_eq!(try_finalize(&state), Some(RebalanceEmit::ToBlend(100_0000000)));
+    assert!(try_finalize(&state));
 }
 
 #[test]
@@ -153,7 +133,7 @@ fn decode_real_phoenix_event_shape_reverse() {
         apply(&mut state, update);
     }
 
-    assert_eq!(try_finalize(&state), Some(RebalanceEmit::FromBlend(100_0000000)));
+    assert!(try_finalize(&state));
 }
 
 fn string_topic(s: &str) -> String {

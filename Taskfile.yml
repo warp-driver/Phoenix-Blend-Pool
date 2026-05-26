@@ -20,9 +20,6 @@ version: '3'
 #   BLENDED_POOL                    Soroban C-address of the Phoenix blended
 #                                   XLM-USDC pool (the new pool_blended deploy).
 #                                   Default: placeholder; override per deploy.
-#   LEGACY_POOL                     Soroban C-address of the legacy Phoenix
-#                                   XLM-USDC pool used as XLM<->USDC swap venue.
-#                                   Default: placeholder; override per deploy.
 #   BLEND_POOL                      Soroban C-address of the Blend USDC lending
 #                                   pool. Default: Blend V1 mainnet pool.
 #   USDC                            USDC Stellar Asset Contract address.
@@ -54,13 +51,18 @@ vars:
   RPC_URL: '{{.RPC_URL | default "https://soroban-testnet.stellar.org"}}'
   NETWORK_PASSPHRASE: '{{.NETWORK_PASSPHRASE | default "Test SDF Network ; September 2015"}}'
   BLENDED_POOL: '{{.BLENDED_POOL | default "CB000000000000000000000000000000000000000000000000000000"}}'
-  LEGACY_POOL: '{{.LEGACY_POOL | default "CB000000000000000000000000000000000000000000000000000000"}}'
   BLEND_POOL: '{{.BLEND_POOL | default "CDVQVKOY2YSXS2IC7KN6MNASSHPAO7UN2UR2ON4OI2SKMFJNVAMDX6DP"}}'
   USDC: '{{.USDC | default "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"}}'
   XLM: '{{.XLM | default "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA"}}'
   BLND: '{{.BLND | default "CD25MNVTZDL4Y3XBCPCJXGXATV5WUHHOWMYFF4YBEGU5FCPGMYTVG5JY"}}'
   BLND_SWAP_POOL: '{{.BLND_SWAP_POOL | default "CB000000000000000000000000000000000000000000000000000000"}}'
   USDC_RESERVE_TOKEN_ID: '{{.USDC_RESERVE_TOKEN_ID | default "1"}}'
+  # Rebalance policy (handler constructor args). target = 50% (5000 bps),
+  # band = ±5% (500 bps), min total USDC below which Rebalance is a no-op
+  # (1e11 = 10_000 USDC at the SAC's 7 decimals).
+  TARGET_RATIO_BPS: '{{.TARGET_RATIO_BPS | default "5000"}}'
+  REBALANCE_BAND_BPS: '{{.REBALANCE_BAND_BPS | default "500"}}'
+  MIN_TOTAL_USDC: '{{.MIN_TOTAL_USDC | default "100000000000"}}'
   TRIGGER_CHAIN: '{{.TRIGGER_CHAIN | default "stellar:pubnet"}}'
   MANAGER_CHAIN: '{{.MANAGER_CHAIN | default "stellar:testnet"}}'
   WORKFLOW_ID: '{{.WORKFLOW_ID | default "rebalance"}}'
@@ -233,8 +235,9 @@ tasks:
   deploy-handler:
     desc: |
       Deploy automation-handler. Reads verification contract from
-      out/deploy.json; takes blended_pool/legacy_pool/blend_pool/usdc/xlm from
-      task vars (overrideable via env). Writes out/handler.json.
+      out/deploy.json; takes blended_pool/blend_pool/usdc/xlm/blnd and the
+      rebalance policy (target/band/min) from task vars (overrideable via
+      env). Writes out/handler.json.
     deps: [build-handler]
     cmds:
       - mkdir -p out
@@ -250,13 +253,15 @@ tasks:
             -- \
             --verification_contract "$VERIFICATION" \
             --blended_pool "{{.BLENDED_POOL}}" \
-            --legacy_pool "{{.LEGACY_POOL}}" \
             --blend_pool "{{.BLEND_POOL}}" \
             --usdc "{{.USDC}}" \
             --xlm "{{.XLM}}" \
             --blnd "{{.BLND}}" \
             --blnd_swap_pool "{{.BLND_SWAP_POOL}}" \
-            --usdc_reserve_token_id "{{.USDC_RESERVE_TOKEN_ID}}")
+            --usdc_reserve_token_id "{{.USDC_RESERVE_TOKEN_ID}}" \
+            --target_ratio_bps "{{.TARGET_RATIO_BPS}}" \
+            --rebalance_band_bps "{{.REBALANCE_BAND_BPS}}" \
+            --min_total_usdc "{{.MIN_TOTAL_USDC}}")
         echo "{\"automation_handler\":\"$HANDLER_ADDR\"}" | jq . > out/handler.json
         cat out/handler.json
 

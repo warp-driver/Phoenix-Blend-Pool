@@ -2,40 +2,45 @@
 
 WarpDrive-driven rebalance automation for the Phoenix XLM-USDC "blended" pool variant (see `../phoenix-contracts/contracts/pool_blended/`). Mirrors the layout of `../hodlers-app/`.
 
-## What it does (v1)
+## What it does
 
-The circuit (`components/circuit/`) subscribes to `swap` events on the blended pool. On each finalized swap, it inspects the direction and emits a `RebalanceAction` payload sized at 10% of the swap's USDC volume:
+The circuit (`components/circuit/`) subscribes to `swap` events on the blended pool. Phoenix fires multiple events per logical swap; the circuit uses a CAS-folded accumulator (one per `tx_hash:op_index`) to emit exactly one `Rebalance` tick per swap. The payload is a bare unit variant — no amount, no direction.
 
-- **Pool gained USDC** (trader sold USDC in) → emit `ToBlend(amount_usdc)`.
-- **Pool lost USDC** (trader bought USDC out) → emit `FromBlend(amount_usdc)`.
+WarpDrive operators sign the envelope; the **aggregator** (`components/aggregator/`) submits it once quorum is reached. The **automation-handler** (`contracts/automation-handler/`) on Stellar verifies the quorum signature via the vendored `ed25519-verification` contract, dedupes by `event_id`, then runs one of two actions:
 
-WarpDrive operators sign the envelope; the **aggregator** (`components/aggregator/`) submits it once quorum is reached. The **automation-handler** (`contracts/automation-handler/`) on Stellar verifies the quorum signature via the vendored `ed25519-verification` contract, dedupes by `event_id`, then dispatches one of three actions:
+- **`Rebalance`** — reads the blended pool's `query_delegate_state` and computes:
+    - `liquid_usdc` = pool's actual on-chain USDC balance (`state.liquid_a` or `state.liquid_b` depending on which side USDC sorts to)
+    - `total_usdc` = `liquid + delegated_out_usdc` (the delegated portion is the principal currently parked in Blend earning interest — it is "virtually in the pool", and the Phoenix pool's reserve counter already reflects it because `withdraw_to_delegate` does not decrement reserves)
+    - `target_liquid` = `total_usdc * target_ratio_bps / 10_000` (default 50%)
+    - `band` = `total_usdc * rebalance_band_bps / 10_000` (default ±5%)
 
-- **`ToBlend(amount_usdc)`** — withdraws `amount_usdc` USDC + the proportional XLM from the blended pool (via `withdraw_to_delegate`), keeping the new pool's physical XLM:USDC ratio steady. Swaps the XLM leg through the legacy Phoenix XLM-USDC pool. Supplies the combined USDC to the Blend lending pool via `submit(Supply)`. Increments `principal_supplied`.
+    If `total_usdc < min_total_usdc` (default 10_000 USDC at 7 decimals), the action is a no-op (event still marked seen). Otherwise:
+    - If `liquid_usdc > target_liquid + band`: `withdraw_to_delegate(USDC, liquid_usdc - target_liquid)` then Blend `submit(Supply, ...)`. `principal_supplied` increases by the same amount.
+    - If `liquid_usdc < target_liquid - band`: Blend `submit(Withdraw, amount)` (capped at `principal_supplied` to guard against bad-debt write-downs) then `deposit_from_delegate(USDC, amount)`. `principal_supplied` decreases.
+    - Inside the band: no-op.
 
-- **`FromBlend(amount_usdc)`** — withdraws `amount_usdc` USDC from Blend via `submit(Withdraw)`. Splits half/half: deposits one half directly as USDC, swaps the other half on the legacy pool for XLM, then deposits both legs back into the blended pool via `deposit_from_delegate`. The pool's DelegatedOutA and DelegatedOutB both decrement. Decrements `principal_supplied`.
+    XLM never moves. Spec calls for 50% of *USDC* in Blend; the XLM side stays fully liquid in the Phoenix pool.
 
-- **`HarvestYield`** (unit variant, no data) — pulls accrued yield from both Blend sources and donates it pro-rata to LPs:
+- **`HarvestYield`** (cron-triggered) — pulls accrued yield from both Blend sources and donates it pro-rata to LPs:
     1. `Blend.claim(...)` for BLND emissions on the USDC supply position.
     2. If BLND received, swap BLND → USDC on the configured BLND-USDC pool.
     3. `Blend.submit(Withdraw, USDC, i128::MAX)` to pull everything (principal + interest), then re-supply `principal_supplied` to restore the position. The leftover USDC is exactly the accrued interest delta.
     4. `blended_pool.donate(USDC, total_yield)` distributes the combined (BLND-swap-proceeds + interest) to LP holders without minting LP tokens.
 
-   `principal_supplied` is tracked on the handler across the ToBlend/FromBlend lifecycle so HarvestYield can isolate just the interest portion without ever reading the b-rate.
+    `principal_supplied` is tracked on the handler across the Rebalance lifecycle so HarvestYield can isolate just the interest portion without ever reading the b-rate.
 
 The handler is the address configured as the blended pool's delegate via `set_delegate(...)`.
 
 The service deploys **two workflows** sharing the same circuit + aggregator wasms:
 
-- **`rebalance`** — Stellar-event trigger on the blended pool's `swap` topic. Emits `ToBlend` / `FromBlend` based on swap direction.
+- **`rebalance`** — Stellar-event trigger on the blended pool's `swap` topic. Emits a `Rebalance` tick per logical swap.
 - **`harvest`** — cron trigger (default `"0 0 0,4,8,12,16,20 * * *"` = top of every 4 hours). Emits `HarvestYield`. Override `HARVEST_SCHEDULE` to tune.
 
 ## What it does NOT do (yet)
 
-- A real drift-vs-target trigger for the rebalance actions (current v1 logic is "emit 10% of every USDC-touching swap"; production should compare current liquid ratio against a 50% target).
-- Cooldown between rebalances (currently fires on every relevant swap).
+- Cooldown between rebalances (currently fires on every swap whose drift breaches the band).
 - Multi-operator deploy beyond a single dev node.
-- Integration tests against mocked Blend / legacy pool / blended pool (placeholder stub in `tests.rs`).
+- Integration tests against mocked Blend / blended pool (placeholder stub in `contracts/automation-handler/src/tests.rs`).
 
 ## Layout
 
@@ -46,7 +51,7 @@ phoenix-blend-pool/
 │   ├── ed25519-security/     ← vendored from warpdrive-contracts
 │   └── ed25519-verification/ ← vendored from warpdrive-contracts
 ├── components/
-│   ├── circuit/              ← WASI 0.2: watches pool, emits RebalanceToBlend
+│   ├── circuit/              ← WASI 0.2: watches pool, emits Rebalance ticks
 │   └── aggregator/           ← trivial Stellar SubmitAction emitter
 ├── wit-definitions/wit/      ← warpdrive WIT worlds
 ├── service/                  ← service.json (generated)

@@ -5,7 +5,6 @@ use warpdrive_shared::ttl;
 pub enum DataKey {
     VerificationContract,
     BlendedPool,
-    LegacyPool,
     BlendPool,
     Usdc,
     Xlm,
@@ -13,6 +12,9 @@ pub enum DataKey {
     BlndSwapPool,
     UsdcReserveTokenId,
     PrincipalSupplied,
+    TargetRatioBps,
+    RebalanceBandBps,
+    MinTotalUsdc,
     Version,
     EventSeen(BytesN<20>),
 }
@@ -40,12 +42,6 @@ address_accessors!(
     set_blended_pool,
     DataKey::BlendedPool,
     "blended pool not set"
-);
-address_accessors!(
-    get_legacy_pool,
-    set_legacy_pool,
-    DataKey::LegacyPool,
-    "legacy pool not set"
 );
 address_accessors!(
     get_blend_pool,
@@ -76,8 +72,51 @@ pub fn get_usdc_reserve_token_id(env: &Env) -> u32 {
         .expect("usdc reserve token id not set")
 }
 
-/// Running sum of net USDC supplied to Blend. Incremented on ToBlend, decremented
-/// on FromBlend. Used by HarvestYield to compute interest = redeemable - principal.
+/// Drift band (bps) around the 50% target above which the handler will move
+/// USDC between Blend and the pool. Set in the constructor; read on each
+/// Rebalance dispatch.
+pub fn set_target_ratio_bps(env: &Env, bps: u32) {
+    env.storage().instance().set(&DataKey::TargetRatioBps, &bps);
+}
+
+pub fn get_target_ratio_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TargetRatioBps)
+        .expect("target ratio bps not set")
+}
+
+pub fn set_rebalance_band_bps(env: &Env, bps: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RebalanceBandBps, &bps);
+}
+
+pub fn get_rebalance_band_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::RebalanceBandBps)
+        .expect("rebalance band bps not set")
+}
+
+/// Floor on the pool's *total* USDC (liquid + delegated) below which Rebalance
+/// is a no-op. Avoids burning gas + Blend min-supply churn on dust pools.
+pub fn set_min_total_usdc(env: &Env, amount: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MinTotalUsdc, &amount);
+}
+
+pub fn get_min_total_usdc(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MinTotalUsdc)
+        .expect("min total usdc not set")
+}
+
+/// Running sum of net USDC supplied to Blend. Incremented on the ToBlend leg
+/// of Rebalance, decremented on the FromBlend leg. Used by HarvestYield to
+/// compute interest = redeemable - principal.
 pub fn set_principal_supplied(env: &Env, amount: i128) {
     env.storage()
         .instance()
