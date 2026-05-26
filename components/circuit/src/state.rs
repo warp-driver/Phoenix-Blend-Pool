@@ -1,33 +1,36 @@
-use anyhow::{anyhow, Context, Result};
+//! Per-tx dedup tombstone via wasi:keyvalue/atomics CAS.
+//!
+//! Phoenix emits many events per logical pool action (8 per swap, 5 per
+//! provide_liquidity, 4-5 per withdraw_liquidity). All of them share the
+//! same tx_hash:op_index. We want exactly one Rebalance tick per logical
+//! action, so the first event whose CAS swap succeeds emits; the rest see
+//! the tombstone and skip.
 
-use crate::phoenix::SwapState;
+use anyhow::{anyhow, Result};
+
 use crate::wasi::keyvalue::atomics;
 use crate::wasi::keyvalue::store;
 
-const BUCKET: &str = "blend-rebalance-circuit-swap-state";
+const BUCKET: &str = "blend-rebalance-circuit-tombstones";
+const MARK: &[u8] = b"1";
 
-/// Atomically read the current SwapState for `key`, apply `mutate`, and commit
-/// the result via wasi:keyvalue/atomics CAS. Retries on CAS conflict so that
-/// concurrent invocations (8 events per Phoenix swap fire in parallel) compose
-/// without losing field updates.
-///
-/// Returns the post-mutation state so the caller can decide whether to finalize.
-pub fn update_with<F, R>(key: &str, mut mutate: F) -> Result<R>
-where
-    F: FnMut(&mut SwapState) -> R,
-{
+/// Returns true iff THIS invocation was the one that first marked `key`.
+/// Subsequent calls for the same key return false. CAS-safe under the
+/// concurrent event fan-out the node performs per logical pool action.
+pub fn mark_if_unseen(key: &str) -> Result<bool> {
     let bucket = open_bucket()?;
     loop {
         let cas = atomics::Cas::new(&bucket, &key.to_string())
             .map_err(|e| anyhow!("cas open: {e:?}"))?;
-        let mut state = match cas.current().map_err(|e| anyhow!("cas current: {e:?}"))? {
-            Some(bytes) => serde_json::from_slice(&bytes).context("deserialize SwapState")?,
-            None => SwapState::default(),
-        };
-        let result = mutate(&mut state);
-        let bytes = serde_json::to_vec(&state).context("serialize SwapState")?;
-        match atomics::swap(cas, &bytes) {
-            Ok(()) => return Ok(result),
+        let current = cas.current().map_err(|e| anyhow!("cas current: {e:?}"))?;
+        if current.is_some() {
+            // Already tombstoned by a prior invocation.
+            return Ok(false);
+        }
+        match atomics::swap(cas, MARK) {
+            Ok(()) => return Ok(true),
+            // Lost the race; another invocation tombstoned first. Re-read to
+            // confirm and return false next iteration.
             Err(atomics::CasError::CasFailed(_)) => continue,
             Err(atomics::CasError::StoreError(e)) => {
                 return Err(anyhow!("cas swap store error: {e:?}"))
@@ -39,3 +42,5 @@ where
 fn open_bucket() -> Result<store::Bucket> {
     store::open(&BUCKET.to_string()).map_err(|e| anyhow!("open kv bucket: {e:?}"))
 }
+
+

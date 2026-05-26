@@ -4,15 +4,15 @@ WarpDrive-driven rebalance automation for the Phoenix XLM-USDC "blended" pool va
 
 ## What it does
 
-The circuit (`components/circuit/`) subscribes to `swap` events on the blended pool. Phoenix fires multiple events per logical swap; the circuit uses a CAS-folded accumulator (one per `tx_hash:op_index`) to emit exactly one `Rebalance` tick per swap. The payload is a bare unit variant — no amount, no direction.
+The circuit (`components/circuit/`) subscribes to all events from the blended pool (rest-wildcard trigger). At the circuit it filters topic[0] to the three event families that move the pool's liquid USDC ratio - `swap`, `provide_liquidity`, `withdraw_liquidity` - and dedupes per `tx_hash:op_index` via a wasi:keyvalue/atomics tombstone so each logical action produces exactly one `Rebalance` tick. The payload is a bare unit variant: no amount, no direction.
 
 WarpDrive operators sign the envelope; the **aggregator** (`components/aggregator/`) submits it once quorum is reached. The **automation-handler** (`contracts/automation-handler/`) on Stellar verifies the quorum signature via the vendored `ed25519-verification` contract, dedupes by `event_id`, then runs one of two actions:
 
-- **`Rebalance`** — reads the blended pool's `query_delegate_state` and computes:
+- **`Rebalance`** - reads the blended pool's `query_delegate_state` and computes:
     - `liquid_usdc` = pool's actual on-chain USDC balance (`state.liquid_a` or `state.liquid_b` depending on which side USDC sorts to)
-    - `total_usdc` = `liquid + delegated_out_usdc` (the delegated portion is the principal currently parked in Blend earning interest — it is "virtually in the pool", and the Phoenix pool's reserve counter already reflects it because `withdraw_to_delegate` does not decrement reserves)
+    - `total_usdc` = `liquid + delegated_out_usdc` (the delegated portion is the principal currently parked in Blend earning interest - it is "virtually in the pool", and the Phoenix pool's reserve counter already reflects it because `withdraw_to_delegate` does not decrement reserves)
     - `target_liquid` = `total_usdc * target_ratio_bps / 10_000` (default 50%)
-    - `band` = `total_usdc * rebalance_band_bps / 10_000` (default ±5%)
+    - `band` = `total_usdc * rebalance_band_bps / 10_000` (default +/-5%)
 
     If `total_usdc < min_total_usdc` (default 10_000 USDC at 7 decimals), the action is a no-op (event still marked seen). Otherwise:
     - If `liquid_usdc > target_liquid + band`: `withdraw_to_delegate(USDC, liquid_usdc - target_liquid)` then Blend `submit(Supply, ...)`. `principal_supplied` increases by the same amount.
@@ -21,9 +21,9 @@ WarpDrive operators sign the envelope; the **aggregator** (`components/aggregato
 
     XLM never moves. Spec calls for 50% of *USDC* in Blend; the XLM side stays fully liquid in the Phoenix pool.
 
-- **`HarvestYield`** (cron-triggered) — pulls accrued yield from both Blend sources and donates it pro-rata to LPs:
+- **`HarvestYield`** (cron-triggered) - pulls accrued yield from both Blend sources and donates it pro-rata to LPs:
     1. `Blend.claim(...)` for BLND emissions on the USDC supply position.
-    2. If BLND received, swap BLND → USDC on the configured BLND-USDC pool.
+    2. If BLND received, swap BLND -> USDC on the configured BLND-USDC pool.
     3. `Blend.submit(Withdraw, USDC, i128::MAX)` to pull everything (principal + interest), then re-supply `principal_supplied` to restore the position. The leftover USDC is exactly the accrued interest delta.
     4. `blended_pool.donate(USDC, total_yield)` distributes the combined (BLND-swap-proceeds + interest) to LP holders without minting LP tokens.
 
@@ -33,14 +33,15 @@ The handler is the address configured as the blended pool's delegate via `set_de
 
 The service deploys **two workflows** sharing the same circuit + aggregator wasms:
 
-- **`rebalance`** — Stellar-event trigger on the blended pool's `swap` topic. Emits a `Rebalance` tick per logical swap.
-- **`harvest`** — cron trigger (default `"0 0 0,4,8,12,16,20 * * *"` = top of every 4 hours). Emits `HarvestYield`. Override `HARVEST_SCHEDULE` to tune.
+- **`rebalance`** - Stellar-event trigger on every event from the blended pool. Circuit filters and emits one `Rebalance` tick per relevant pool action.
+- **`harvest`** - cron trigger (default `"0 0 0,4,8,12,16,20 * * *"` = top of every 4 hours). Emits `HarvestYield`. Override `HARVEST_SCHEDULE` to tune.
 
 ## What it does NOT do (yet)
 
-- Cooldown between rebalances (currently fires on every swap whose drift breaches the band).
+- Cooldown between rebalances (currently fires on every relevant pool action whose drift breaches the band).
 - Multi-operator deploy beyond a single dev node.
 - Integration tests against mocked Blend / blended pool (placeholder stub in `contracts/automation-handler/src/tests.rs`).
+- KV tombstone garbage collection (see CLAUDE.md note on finalized-tombstone GC).
 
 ## Layout
 

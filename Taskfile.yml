@@ -58,7 +58,7 @@ vars:
   BLND_SWAP_POOL: '{{.BLND_SWAP_POOL | default "CB000000000000000000000000000000000000000000000000000000"}}'
   USDC_RESERVE_TOKEN_ID: '{{.USDC_RESERVE_TOKEN_ID | default "1"}}'
   # Rebalance policy (handler constructor args). target = 50% (5000 bps),
-  # band = ±5% (500 bps), min total USDC below which Rebalance is a no-op
+  # band = +/- 5% (500 bps), min total USDC below which Rebalance is a no-op
   # (1e11 = 10_000 USDC at the SAC's 7 decimals).
   TARGET_RATIO_BPS: '{{.TARGET_RATIO_BPS | default "5000"}}'
   REBALANCE_BAND_BPS: '{{.REBALANCE_BAND_BPS | default "500"}}'
@@ -149,14 +149,16 @@ tasks:
         AGG_DIGEST=$(cat out/aggregator.digest)
         warpdrive-cli service -f {{.SERVICE_FILE}} init --name phoenix-blend-pool
 
-        # ── workflow 1: rebalance (Stellar swap events) ────────────────────
+        # workflow 1: rebalance. rest-wildcard on the trigger delivers every
+        # pool event to the circuit; the circuit filters topic[0] to
+        # {swap, provide_liquidity, withdraw_liquidity} (all three move the
+        # liquid USDC ratio) and dedupes per tx_hash:op_index.
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow add --id {{.WORKFLOW_ID}}
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow trigger \
             --id {{.WORKFLOW_ID}} set-stellar \
             --contract-id {{.BLENDED_POOL}} \
             --chain {{.TRIGGER_CHAIN}} \
-            --topic string:swap \
-            --topic wildcard
+            --topic rest-wildcard
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow component \
             --id {{.WORKFLOW_ID}} set-source-digest --digest "$CIRCUIT_DIGEST"
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow submit \
@@ -168,7 +170,7 @@ tasks:
             --values "chain={{.MANAGER_CHAIN}}" \
             --values "service_handler=$HANDLER"
 
-        # ── workflow 2: harvest (cron) ─────────────────────────────────────
+        # workflow 2: harvest (cron)
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow add --id {{.HARVEST_WORKFLOW_ID}}
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow trigger \
             --id {{.HARVEST_WORKFLOW_ID}} set-cron \

@@ -19,15 +19,15 @@ const BPS_DEN: i128 = 10_000;
 ///
 /// Two variants:
 ///
-/// - `Rebalance` — read the blended pool's `query_delegate_state`, compare
+/// - `Rebalance` - read the blended pool's `query_delegate_state`, compare
 ///   `liquid_usdc / total_usdc` against the configured 50% target (where
-///   `total_usdc = liquid + delegated` — the delegated portion is the
+///   `total_usdc = liquid + delegated` - the delegated portion is the
 ///   principal sitting in Blend, accounted as "virtually in the pool").
 ///   If the drift exceeds `rebalance_band_bps`, move USDC between the pool's
 ///   liquid balance and Blend to restore the target. Skips if total USDC is
 ///   below `min_total_usdc`.
 ///
-/// - `HarvestYield` — extract accrued yield (BLND emissions + USDC interest
+/// - `HarvestYield` - extract accrued yield (BLND emissions + USDC interest
 ///   from b-token appreciation), convert to USDC, donate to LP holders
 ///   pro-rata via `pool.donate(USDC, ...)`.
 ///
@@ -167,7 +167,7 @@ impl AutomationHandler {
 /// delegated` (delegated USDC sits in Blend earning interest but is still
 /// "virtually in the pool"), so we treat it as the authoritative denominator.
 ///
-/// Below `min_total_usdc` this is a no-op — the event is still marked seen so
+/// Below `min_total_usdc` this is a no-op - the event is still marked seen so
 /// it doesn't replay, just no transfer fires.
 fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
     let blended_pool = storage::get_blended_pool(env);
@@ -200,7 +200,7 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
     let lower = target_liquid.saturating_sub(band);
 
     if liquid_usdc > upper {
-        // Pool is over-liquid in USDC — supply the excess to Blend.
+        // Pool is over-liquid in USDC - supply the excess to Blend.
         let amount = liquid_usdc
             .checked_sub(target_liquid)
             .ok_or(HandlerError::OtherInvocationError)?;
@@ -213,7 +213,7 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
                 .ok_or(HandlerError::OtherInvocationError)?,
         );
     } else if liquid_usdc < lower {
-        // Pool is under-liquid in USDC — pull from Blend to top up.
+        // Pool is under-liquid in USDC - pull from Blend to top up.
         let mut amount = target_liquid
             .checked_sub(liquid_usdc)
             .ok_or(HandlerError::OtherInvocationError)?;
@@ -239,7 +239,7 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
 ///
 /// Mechanic:
 ///   1. Claim BLND emissions for our USDC supply position.
-///   2. Swap any BLND received → USDC on the configured BLND-USDC pool.
+///   2. Swap any BLND received -> USDC on the configured BLND-USDC pool.
 ///   3. Withdraw everything from Blend (Blend treats i128::MAX as "all
 ///      available"), then re-supply `principal_supplied`. The leftover USDC
 ///      is exactly the accrued interest delta.
@@ -267,7 +267,7 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
         &env.current_contract_address(),
     );
 
-    // 2. Swap any BLND we just received → USDC. Skip if zero.
+    // 2. Swap any BLND we just received -> USDC. Skip if zero.
     let blnd_token = soroban_sdk::token::Client::new(env, &blnd);
     let blnd_balance = blnd_token.balance(&env.current_contract_address());
     if blnd_balance > 0 {
@@ -295,7 +295,7 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
 
     // 4. Total yield = USDC balance delta over the whole flow = BLND swap
     //    proceeds + interest. Donate to LPs (no-op if zero or somehow negative
-    //    — the latter would indicate a Blend bad-debt write-down).
+    //    - the latter would indicate a Blend bad-debt write-down).
     let usdc_end = usdc_token.balance(&env.current_contract_address());
     let total_yield = usdc_end.saturating_sub(usdc_start);
 

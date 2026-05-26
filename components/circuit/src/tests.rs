@@ -1,5 +1,5 @@
 use crate::payload::{self, Direction};
-use crate::phoenix::{apply, decode_field, try_finalize, FieldUpdate, SwapState, USDC_SAC_CONTRACT_ID};
+use crate::phoenix::is_relevant_event;
 use std::str::FromStr;
 use stellar_xdr::curr::{
     Int128Parts, Limits, ReadXdr, ScAddress, ScString, ScSymbol, ScVal, StringM, WriteXdr,
@@ -37,105 +37,77 @@ fn payload_encodes_harvest_yield_unit_variant() {
 }
 
 #[test]
-fn finalize_emits_when_usdc_sold_into_pool() {
-    let mut s = SwapState::default();
-    apply(&mut s, FieldUpdate::SellToken(USDC_SAC_CONTRACT_ID.into()));
-    apply(&mut s, FieldUpdate::BuyToken("CXLM_PLACEHOLDER".into()));
-    apply(&mut s, FieldUpdate::OfferAmount(1_000_0000000));
-    assert!(!try_finalize(&s), "not finalized until both amounts arrive");
-    apply(&mut s, FieldUpdate::ReturnAmount(2_500_0000000));
-    assert!(try_finalize(&s));
+fn filter_passes_swap_event() {
+    let topic = vec![sym_topic("swap"), sym_topic("sender")];
+    assert!(is_relevant_event(&topic).unwrap());
 }
 
 #[test]
-fn finalize_emits_when_usdc_bought_out_of_pool() {
-    let mut s = SwapState::default();
-    apply(&mut s, FieldUpdate::SellToken("CXLM_PLACEHOLDER".into()));
-    apply(&mut s, FieldUpdate::BuyToken(USDC_SAC_CONTRACT_ID.into()));
-    apply(&mut s, FieldUpdate::OfferAmount(2_500_0000000));
-    apply(&mut s, FieldUpdate::ReturnAmount(1_000_0000000));
-    assert!(try_finalize(&s));
+fn filter_passes_provide_liquidity_event() {
+    let topic = vec![sym_topic("provide_liquidity"), sym_topic("token_a-amount")];
+    assert!(is_relevant_event(&topic).unwrap());
 }
 
 #[test]
-fn finalize_skips_non_usdc_swap() {
-    // Defensive: if the trigger ever gets pointed at a non-USDC pool,
-    // we shouldn't emit a Rebalance for it.
-    let mut s = SwapState::default();
-    apply(&mut s, FieldUpdate::SellToken("CFOO".into()));
-    apply(&mut s, FieldUpdate::BuyToken("CBAR".into()));
-    apply(&mut s, FieldUpdate::OfferAmount(100));
-    apply(&mut s, FieldUpdate::ReturnAmount(99));
-    assert!(!try_finalize(&s));
+fn filter_passes_withdraw_liquidity_event() {
+    let topic = vec![sym_topic("withdraw_liquidity"), sym_topic("return_amount_a")];
+    assert!(is_relevant_event(&topic).unwrap());
 }
 
 #[test]
-fn finalize_skips_until_all_fields_present() {
-    let mut s = SwapState::default();
-    apply(&mut s, FieldUpdate::SellToken(USDC_SAC_CONTRACT_ID.into()));
-    assert!(!try_finalize(&s));
-    apply(&mut s, FieldUpdate::BuyToken("CXLM".into()));
-    assert!(!try_finalize(&s));
-    apply(&mut s, FieldUpdate::OfferAmount(1));
-    assert!(!try_finalize(&s));
-    apply(&mut s, FieldUpdate::ReturnAmount(1));
-    assert!(try_finalize(&s));
+fn filter_passes_string_topic0() {
+    // Phoenix mixes String and Symbol for topic[0] across entrypoints; the
+    // filter must accept either encoding.
+    let topic = vec![string_topic("swap"), string_topic("offer_amount")];
+    assert!(is_relevant_event(&topic).unwrap());
 }
 
 #[test]
-fn finalize_does_not_depend_on_amount_magnitude() {
-    // Dust swaps still tick — handler decides whether the drift is large
-    // enough to actually act, and applies the min_total_usdc floor too.
-    let mut s = SwapState::default();
-    apply(&mut s, FieldUpdate::SellToken(USDC_SAC_CONTRACT_ID.into()));
-    apply(&mut s, FieldUpdate::BuyToken("CXLM".into()));
-    apply(&mut s, FieldUpdate::OfferAmount(1));
-    apply(&mut s, FieldUpdate::ReturnAmount(1));
-    assert!(try_finalize(&s));
-}
-
-#[test]
-fn decode_real_phoenix_event_shape_forward() {
-    let xlm = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA";
-    let usdc = USDC_SAC_CONTRACT_ID;
-
-    let events = [
-        (string_topic("swap"), string_topic("sell_token"), addr_value(usdc)),
-        (string_topic("swap"), string_topic("offer_amount"), i128_value(1_000_0000000)),
-        (string_topic("swap"), string_topic("buy_token"), addr_value(xlm)),
-        (string_topic("swap"), string_topic("return_amount"), i128_value(2_500_0000000)),
-    ];
-
-    let mut state = SwapState::default();
-    for (t0, t1, v) in &events {
-        let update = decode_field(&[t0.clone(), t1.clone()], v).unwrap();
-        apply(&mut state, update);
+fn filter_rejects_delegate_events() {
+    // blend_pool/* events are emitted by the pool when the handler itself
+    // moves USDC. Re-triggering off them would loop.
+    for tag in ["blend_pool", "XYK Pool: ", "transfer", "burn", "mint"] {
+        let topic = vec![sym_topic(tag), sym_topic("anything")];
+        assert!(
+            !is_relevant_event(&topic).unwrap(),
+            "topic[0]={tag} must not trigger Rebalance"
+        );
     }
-
-    assert!(try_finalize(&state));
 }
 
 #[test]
-fn decode_real_phoenix_event_shape_reverse() {
-    let xlm = "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA";
-    let usdc = USDC_SAC_CONTRACT_ID;
-
-    let events = [
-        (string_topic("swap"), string_topic("sell_token"), addr_value(xlm)),
-        (string_topic("swap"), string_topic("offer_amount"), i128_value(2_500_0000000)),
-        (string_topic("swap"), string_topic("buy_token"), addr_value(usdc)),
-        (string_topic("swap"), string_topic("return_amount"), i128_value(1_000_0000000)),
-    ];
-
-    let mut state = SwapState::default();
-    for (t0, t1, v) in &events {
-        let update = decode_field(&[t0.clone(), t1.clone()], v).unwrap();
-        apply(&mut state, update);
-    }
-
-    assert!(try_finalize(&state));
+fn filter_rejects_empty_topic() {
+    let topic: Vec<String> = Vec::new();
+    assert!(!is_relevant_event(&topic).unwrap());
 }
 
+#[test]
+fn filter_rejects_non_string_symbol_topic() {
+    // Address or i128 as topic[0] is not a Phoenix-emitted shape; reject it.
+    let topic = vec![
+        i128_value(42),
+        sym_topic("anything"),
+    ];
+    assert!(!is_relevant_event(&topic).unwrap());
+}
+
+#[test]
+fn filter_with_real_phoenix_swap_event_shape() {
+    // Matches the actual XDR-base64 wire shape produced by Phoenix.
+    let topic = vec![string_topic("swap"), string_topic("sell_token")];
+    assert!(is_relevant_event(&topic).unwrap());
+}
+
+#[test]
+fn filter_with_real_phoenix_withdraw_event_shape() {
+    let topic = vec![
+        string_topic("withdraw_liquidity"),
+        string_topic("return_amount_a"),
+    ];
+    assert!(is_relevant_event(&topic).unwrap());
+}
+
+/// String-encoded topic segment (Phoenix uses this for entrypoint emissions).
 fn string_topic(s: &str) -> String {
     let inner: StringM = s.try_into().unwrap();
     ScVal::String(ScString(inner))
@@ -143,15 +115,26 @@ fn string_topic(s: &str) -> String {
         .unwrap()
 }
 
-fn addr_value(strkey: &str) -> String {
-    let addr = ScAddress::from_str(strkey).unwrap();
-    ScVal::Address(addr).to_xdr_base64(Limits::none()).unwrap()
+/// Symbol-encoded topic segment (also legal for Soroban events).
+fn sym_topic(s: &str) -> String {
+    let inner: StringM<32> = s.as_bytes().try_into().unwrap();
+    ScVal::Symbol(ScSymbol(inner))
+        .to_xdr_base64(Limits::none())
+        .unwrap()
 }
 
+/// XDR-encoded i128 to verify the filter rejects non-string topics.
 fn i128_value(n: i128) -> String {
     let hi = (n >> 64) as i64;
     let lo = n as u64;
     ScVal::I128(Int128Parts { hi, lo })
         .to_xdr_base64(Limits::none())
         .unwrap()
+}
+
+/// Address strkey to mirror a hostile-input scenario.
+#[allow(dead_code)]
+fn addr_value(strkey: &str) -> String {
+    let addr = ScAddress::from_str(strkey).unwrap();
+    ScVal::Address(addr).to_xdr_base64(Limits::none()).unwrap()
 }

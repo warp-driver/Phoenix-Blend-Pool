@@ -23,55 +23,46 @@ impl Guest for Component {
 
 fn run_inner(trigger_action: TriggerAction) -> anyhow::Result<Vec<WasmResponse>> {
     match trigger_action.data {
-        TriggerData::StellarContractEvent(e) => handle_swap_event(e.event),
+        TriggerData::StellarContractEvent(e) => handle_pool_event(e.event),
         TriggerData::Cron(_) => Ok(vec![harvest_yield_response()?]),
         _ => anyhow::bail!("unexpected trigger type"),
     }
 }
 
-fn handle_swap_event(
+fn handle_pool_event(
     event: warpdrive::types::chain::StellarEvent,
 ) -> anyhow::Result<Vec<WasmResponse>> {
-    // tx_hash:op_index — same accumulator key Soroban uses for canonical
-    // event_id derivation. We rely on it being unique per logical swap.
+    // Cheap topic filter first. The node wakes us on every event from the
+    // pool (rest-wildcard on the trigger), so most invocations are not
+    // ones we care about (delegate-emitted events from our own actions,
+    // admin events, etc.).
+    if !phoenix::is_relevant_event(&event.topic_segments)? {
+        return Ok(vec![]);
+    }
+
+    // tx_hash:op_index is the canonical dedup unit. Phoenix fires many
+    // events per logical pool action (swap, provide_liquidity,
+    // withdraw_liquidity), all sharing this id. The CAS tombstone gates
+    // emission to exactly one Rebalance tick per logical action.
     let key = format!(
         "{}:{}",
         event.transaction_hash,
         event.operation_index.unwrap_or(0)
     );
 
-    let update = phoenix::decode_field(&event.topic_segments, &event.value)?;
-
-    // CAS-update the per-swap accumulator. Returns the rebalance emit only
-    // if THIS invocation is the one that completed the SwapState and flipped
-    // `finalized` true. wasi:keyvalue/atomics makes the read-modify-write
-    // safe under the 8 concurrent events Phoenix fires per swap.
-    // CAS-update the per-swap accumulator. Returns true if THIS invocation
-    // is the one that completed the SwapState and flipped `finalized`.
-    // wasi:keyvalue/atomics makes the read-modify-write safe under the 8
-    // concurrent events Phoenix fires per swap.
-    let should_emit = state::update_with(&key, |s| {
-        phoenix::apply(s, update.clone());
-        if !s.finalized && phoenix::try_finalize(s) {
-            s.finalized = true;
-            return true;
-        }
-        false
-    })?;
-
-    if should_emit {
-        let bytes = payload::encode(payload::Direction::Rebalance)?;
-        return Ok(vec![WasmResponse {
-            payload: bytes,
-            ordering: None,
-            event_id_salt: None,
-        }]);
+    if !state::mark_if_unseen(&key)? {
+        return Ok(vec![]);
     }
 
-    Ok(vec![])
+    let bytes = payload::encode(payload::Direction::Rebalance)?;
+    Ok(vec![WasmResponse {
+        payload: bytes,
+        ordering: None,
+        event_id_salt: None,
+    }])
 }
 
-/// Cron-fired HarvestYield. No accumulator needed — every tick is a fresh
+/// Cron-fired HarvestYield. No accumulator needed: every tick is a fresh
 /// "harvest now" instruction, and the framework assigns a unique event_id
 /// per cron firing so the handler dedupes naturally.
 fn harvest_yield_response() -> anyhow::Result<WasmResponse> {
