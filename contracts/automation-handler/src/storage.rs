@@ -15,6 +15,8 @@ pub enum DataKey {
     TargetRatioBps,
     RebalanceBandBps,
     MinTotalUsdc,
+    RebalanceCooldownSecs,
+    LastRebalanceTs,
     Version,
     EventSeen(BytesN<20>),
 }
@@ -112,6 +114,36 @@ pub fn get_min_total_usdc(env: &Env) -> i128 {
         .instance()
         .get(&DataKey::MinTotalUsdc)
         .expect("min total usdc not set")
+}
+
+/// Minimum seconds between two successive rebalance moves. Set in the
+/// constructor; checked at the top of execute_rebalance. The cooldown gates
+/// only ACTIONS, not no-op invocations: a within-band or below-min check
+/// returns without touching this timestamp.
+pub fn set_rebalance_cooldown_secs(env: &Env, secs: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::RebalanceCooldownSecs, &secs);
+}
+
+pub fn get_rebalance_cooldown_secs(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::RebalanceCooldownSecs)
+        .expect("rebalance cooldown secs not set")
+}
+
+pub fn set_last_rebalance_ts(env: &Env, ts: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LastRebalanceTs, &ts);
+}
+
+pub fn get_last_rebalance_ts(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::LastRebalanceTs)
+        .unwrap_or(0)
 }
 
 /// Running sum of net USDC supplied to Blend. Incremented on the ToBlend leg

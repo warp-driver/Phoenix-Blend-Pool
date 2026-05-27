@@ -59,6 +59,7 @@ impl AutomationHandler {
         target_ratio_bps: u32,
         rebalance_band_bps: u32,
         min_total_usdc: i128,
+        rebalance_cooldown_secs: u64,
     ) {
         assert!(
             target_ratio_bps > 0 && target_ratio_bps < BPS_DEN as u32,
@@ -81,6 +82,8 @@ impl AutomationHandler {
         storage::set_target_ratio_bps(&env, target_ratio_bps);
         storage::set_rebalance_band_bps(&env, rebalance_band_bps);
         storage::set_min_total_usdc(&env, min_total_usdc);
+        storage::set_rebalance_cooldown_secs(&env, rebalance_cooldown_secs);
+        storage::set_last_rebalance_ts(&env, 0);
         storage::set_principal_supplied(&env, 0);
         storage::set_version(&env, &String::from_str(&env, env!("CARGO_PKG_VERSION")));
         storage::extend_instance_ttl(&env);
@@ -156,8 +159,40 @@ impl AutomationHandler {
         storage::get_principal_supplied(&env)
     }
 
+    pub fn rebalance_cooldown_secs(env: Env) -> u64 {
+        storage::get_rebalance_cooldown_secs(&env)
+    }
+
+    pub fn last_rebalance_ts(env: Env) -> u64 {
+        storage::get_last_rebalance_ts(&env)
+    }
+
     pub fn payload(_env: Env, _event_id: BytesN<20>) -> Option<Bytes> {
         None
+    }
+}
+
+/// Test-only entrypoints that bypass envelope + signature verification and
+/// invoke the executors directly. Useful for exercising the rebalance and
+/// harvest dispatch logic without constructing a real quorum envelope.
+/// Excluded from production builds.
+#[cfg(test)]
+#[contractimpl]
+impl AutomationHandler {
+    pub fn test_rebalance(env: Env) -> Result<(), HandlerError> {
+        execute_rebalance(&env)
+    }
+
+    pub fn test_harvest(env: Env) -> Result<(), HandlerError> {
+        execute_harvest_yield(&env)
+    }
+
+    pub fn test_set_principal_supplied(env: Env, amount: i128) {
+        storage::set_principal_supplied(&env, amount);
+    }
+
+    pub fn test_set_last_rebalance_ts(env: Env, ts: u64) {
+        storage::set_last_rebalance_ts(&env, ts);
     }
 }
 
@@ -190,6 +225,16 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         return Err(HandlerError::InvalidEnvelope);
     }
 
+    // Cooldown gate: only ACTIONS (actual fund moves) are rate-limited.
+    // No-op branches (below min, within band, dust) return without touching
+    // last_rebalance_ts, so the next event after a gap can still react.
+    let now = env.ledger().timestamp();
+    let last_ts = storage::get_last_rebalance_ts(env);
+    let cooldown = storage::get_rebalance_cooldown_secs(env);
+    if now < last_ts.saturating_add(cooldown) {
+        return Ok(());
+    }
+
     let target_bps = storage::get_target_ratio_bps(env) as i128;
     let band_bps = storage::get_rebalance_band_bps(env) as i128;
     let target_liquid = mul_div(total_usdc, target_bps, BPS_DEN)?;
@@ -212,6 +257,7 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
             prev.checked_add(amount)
                 .ok_or(HandlerError::OtherInvocationError)?,
         );
+        storage::set_last_rebalance_ts(env, now);
     } else if liquid_usdc < lower {
         // Pool is under-liquid in USDC - pull from Blend to top up.
         let mut amount = target_liquid
@@ -229,6 +275,7 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
             blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, amount);
             pool_client.deposit_from_delegate(&usdc, &amount);
             storage::set_principal_supplied(env, (principal - amount).max(0));
+            storage::set_last_rebalance_ts(env, now);
         }
     }
     // Inside the band: no-op.
@@ -283,14 +330,29 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
         );
     }
 
-    // 3. Withdraw-all + re-supply principal to extract just the interest.
-    //    i128::MAX is the canonical "withdraw everything redeemable" sentinel;
-    //    Blend caps it at the position's actual b-token value. The re-supply
-    //    re-establishes the same principal, so principal_supplied stays
-    //    consistent across harvest cycles.
+    // 3. Withdraw-all from Blend, then re-supply only what was actually
+    //    redeemable. In the happy case actual_redeemable = principal +
+    //    accrued_interest, so we re-supply `principal` and leave the
+    //    accrued_interest as part of `total_yield`. In a bad-debt write-down
+    //    case actual_redeemable < principal, so we re-supply everything we
+    //    got back and shrink `principal_supplied` to match the new on-chain
+    //    position. Without this clamp, the unconditional `Supply(principal)`
+    //    would request more USDC than we hold, reverting the whole harvest
+    //    and stranding the (now-fully-withdrawn) position outside Blend.
     if principal > 0 {
+        let usdc_before_withdraw = usdc_token.balance(&env.current_contract_address());
         blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, i128::MAX);
-        blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, principal);
+        let usdc_after_withdraw = usdc_token.balance(&env.current_contract_address());
+        let actual_redeemable = usdc_after_withdraw.saturating_sub(usdc_before_withdraw);
+
+        let supply_amount = principal.min(actual_redeemable);
+        if supply_amount > 0 {
+            blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, supply_amount);
+        }
+        // principal_supplied tracks the position currently in Blend. In the
+        // happy case this re-sets it to the same value; in a write-down case
+        // it shrinks to actual_redeemable.
+        storage::set_principal_supplied(env, supply_amount);
     }
 
     // 4. Total yield = USDC balance delta over the whole flow = BLND swap

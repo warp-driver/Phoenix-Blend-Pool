@@ -63,6 +63,9 @@ vars:
   TARGET_RATIO_BPS: '{{.TARGET_RATIO_BPS | default "5000"}}'
   REBALANCE_BAND_BPS: '{{.REBALANCE_BAND_BPS | default "500"}}'
   MIN_TOTAL_USDC: '{{.MIN_TOTAL_USDC | default "100000000000"}}'
+  # Minimum seconds between two successive rebalance moves. 300s = 5 min:
+  # plenty of room for trading flow to settle and avoid Blend min-supply churn.
+  REBALANCE_COOLDOWN_SECS: '{{.REBALANCE_COOLDOWN_SECS | default "300"}}'
   TRIGGER_CHAIN: '{{.TRIGGER_CHAIN | default "stellar:pubnet"}}'
   MANAGER_CHAIN: '{{.MANAGER_CHAIN | default "stellar:testnet"}}'
   WORKFLOW_ID: '{{.WORKFLOW_ID | default "rebalance"}}'
@@ -263,7 +266,8 @@ tasks:
             --usdc_reserve_token_id "{{.USDC_RESERVE_TOKEN_ID}}" \
             --target_ratio_bps "{{.TARGET_RATIO_BPS}}" \
             --rebalance_band_bps "{{.REBALANCE_BAND_BPS}}" \
-            --min_total_usdc "{{.MIN_TOTAL_USDC}}")
+            --min_total_usdc "{{.MIN_TOTAL_USDC}}" \
+            --rebalance_cooldown_secs "{{.REBALANCE_COOLDOWN_SECS}}")
         echo "{\"automation_handler\":\"$HANDLER_ADDR\"}" | jq . > out/handler.json
         cat out/handler.json
 
