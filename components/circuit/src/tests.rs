@@ -92,6 +92,44 @@ fn filter_rejects_non_string_symbol_topic() {
 }
 
 #[test]
+fn filter_silently_skips_malformed_base64() {
+    // A topic segment that isn't valid base64 used to propagate Err; now
+    // it returns Ok(false) so a noisy event-emitter can't dominate the
+    // host log.
+    let topic = vec!["!!!not-base64!!!".to_string()];
+    assert!(!is_relevant_event(&topic).unwrap());
+}
+
+#[test]
+fn filter_rejects_case_mismatched_topic() {
+    // "Swap" is not the same as "swap". Phoenix only emits lower-case.
+    let topic = vec![sym_topic("Swap")];
+    assert!(!is_relevant_event(&topic).unwrap());
+}
+
+#[test]
+fn filter_rejects_unknown_symbol() {
+    // A Phoenix admin event (e.g. "set_admin") is a legal Symbol topic but
+    // not one we care about; reject without panicking.
+    let topic = vec![sym_topic("set_admin")];
+    assert!(!is_relevant_event(&topic).unwrap());
+}
+
+#[test]
+fn filter_handles_extra_topic_segments_after_match() {
+    // Phoenix swap events carry additional topic segments (trader address,
+    // path token addresses). The filter only inspects topic[0]; extra
+    // segments do not change the verdict.
+    let topic = vec![
+        sym_topic("swap"),
+        i128_value(0),
+        i128_value(0),
+        i128_value(0),
+    ];
+    assert!(is_relevant_event(&topic).unwrap());
+}
+
+#[test]
 fn filter_with_real_phoenix_swap_event_shape() {
     // Matches the actual XDR-base64 wire shape produced by Phoenix.
     let topic = vec![string_topic("swap"), string_topic("sell_token")];

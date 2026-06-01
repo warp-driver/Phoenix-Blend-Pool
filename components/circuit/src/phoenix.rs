@@ -17,7 +17,7 @@
 //! Everything else (delegate-side events from our own actions, admin
 //! events, ERC-20-style transfer/mint/burn) is ignored.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use stellar_xdr::curr::{Limits, ReadXdr, ScSymbol, ScVal};
 
 const TOPIC_SWAP: &str = "swap";
@@ -25,15 +25,24 @@ const TOPIC_PROVIDE_LIQUIDITY: &str = "provide_liquidity";
 const TOPIC_WITHDRAW_LIQUIDITY: &str = "withdraw_liquidity";
 
 /// True if topic[0] is one of the three event families that move the pool's
-/// liquid USDC ratio. Returns false on any unrecognised or empty topic.
+/// liquid USDC ratio. Returns false on any unrecognised, empty, or
+/// undecodable topic.
 ///
-/// Decoding errors propagate so the host log shows what broke; the node will
-/// not call back for the offending event, which is the safe failure mode.
+/// Hostile or malformed topic segments (e.g. invalid base64, ScVal types
+/// other than String/Symbol) are silently skipped rather than propagated
+/// as Err: the only callers we have process one event at a time, and we
+/// do not want a single noisy event-emitter to dominate the host log.
+/// Legitimate Phoenix event-shape changes still surface via the empty
+/// return values - the dashboard's "no rebalance fired in N hours" alert
+/// catches that case.
 pub fn is_relevant_event(topic_segments: &[String]) -> Result<bool> {
     let Some(first) = topic_segments.first() else {
         return Ok(false);
     };
-    let scval = ScVal::from_xdr_base64(first, Limits::none()).context("decode topic[0]")?;
+    let scval = match ScVal::from_xdr_base64(first, Limits::none()) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
     let topic = match scval {
         ScVal::Symbol(ScSymbol(s)) => s.to_string(),
         ScVal::String(s) => s.to_string(),
