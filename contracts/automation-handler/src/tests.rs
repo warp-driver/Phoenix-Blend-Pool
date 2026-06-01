@@ -1100,3 +1100,107 @@ fn harvest_skips_withdraw_resupply_when_blend_frozen() {
         "principal_supplied unchanged when Blend leg is skipped",
     );
 }
+
+// --- Post-construction config setters ---------------------------------------
+
+#[test]
+fn admin_can_retune_target_ratio_bps() {
+    let h = setup();
+    h.handler.set_target_ratio_bps(&6000);
+    assert_eq!(h.handler.target_ratio_bps(), 6000);
+}
+
+#[test]
+#[should_panic(expected = "target_ratio_bps must be in (0, 10000)")]
+fn target_ratio_bps_zero_rejected() {
+    let h = setup();
+    h.handler.set_target_ratio_bps(&0);
+}
+
+#[test]
+#[should_panic(expected = "target_ratio_bps must be in (0, 10000)")]
+fn target_ratio_bps_at_cap_rejected() {
+    let h = setup();
+    h.handler.set_target_ratio_bps(&10_000);
+}
+
+#[test]
+fn admin_can_retune_rebalance_band_bps() {
+    let h = setup();
+    h.handler.set_rebalance_band_bps(&750);
+    assert_eq!(h.handler.rebalance_band_bps(), 750);
+}
+
+#[test]
+#[should_panic(expected = "rebalance_band_bps must be < 10000")]
+fn rebalance_band_at_cap_rejected() {
+    let h = setup();
+    h.handler.set_rebalance_band_bps(&10_000);
+}
+
+#[test]
+fn admin_can_retune_min_total_usdc() {
+    let h = setup();
+    h.handler.set_min_total_usdc(&5_000_000_000);
+    assert_eq!(h.handler.min_total_usdc(), 5_000_000_000);
+}
+
+#[test]
+#[should_panic(expected = "min_total_usdc must be non-negative")]
+fn negative_min_total_usdc_rejected() {
+    let h = setup();
+    h.handler.set_min_total_usdc(&-1);
+}
+
+#[test]
+fn admin_can_retune_rebalance_cooldown_secs() {
+    let h = setup();
+    h.handler.set_rebalance_cooldown_secs(&3600);
+    assert_eq!(h.handler.rebalance_cooldown_secs(), 3600);
+}
+
+#[test]
+fn admin_can_zero_cooldown() {
+    let h = setup();
+    h.handler.set_rebalance_cooldown_secs(&0);
+    assert_eq!(h.handler.rebalance_cooldown_secs(), 0);
+}
+
+#[test]
+fn admin_can_rotate_blnd_treasury() {
+    let h = setup();
+    let new_treasury = Address::generate(&h.env);
+    h.handler.set_blnd_treasury(&new_treasury);
+    assert_eq!(h.handler.blnd_treasury(), new_treasury);
+}
+
+#[test]
+fn admin_can_update_usdc_reserve_token_id() {
+    let h = setup();
+    h.handler.set_usdc_reserve_token_id(&3);
+    assert_eq!(h.handler.usdc_reserve_token_id(), 3);
+}
+
+#[test]
+fn updated_target_changes_band_check_behaviour() {
+    // Sanity: after retuning target to 70%, a 50%-liquid state lies below
+    // the new band so rebalance should fire a ToBlend... wait, reversed:
+    // target=70% means we want MORE liquid USDC. So 50%-liquid is BELOW
+    // target. Rebalance pulls FROM blend to top up.
+    let h = setup();
+    h.handler.set_target_ratio_bps(&7000);
+    h.handler.set_rebalance_band_bps(&500);
+
+    let liquid: i128 = 500_000_000_000;
+    let delegated: i128 = 500_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.handler.test_set_principal_supplied(&delegated);
+    seed_blend_supply(&h, delegated);
+    h.handler.test_set_principal_supplied(&delegated);
+
+    h.handler.test_rebalance();
+
+    let wd = h.mock_blend.last_submit_withdraw().expect("Withdraw not called");
+    assert_eq!(wd.0, h.usdc);
+    assert!(wd.1 > 0);
+}

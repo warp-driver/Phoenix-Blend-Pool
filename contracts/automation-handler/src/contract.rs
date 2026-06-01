@@ -7,8 +7,8 @@ use warpdrive_shared::interfaces::{
     warpdrive::{ContractUpgraded, WarpDriveInterface},
 };
 use crate::events::{
-    ConfigUpdated, EmergencyUnwound, HarvestCompleted, PauseToggled, RebalanceExecuted,
-    DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
+    AddressConfigUpdated, ConfigUpdated, EmergencyUnwound, HarvestCompleted, PauseToggled,
+    RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
 };
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
@@ -300,6 +300,69 @@ impl AutomationHandler {
 
         storage::set_principal_supplied(&env, 0);
         EmergencyUnwound::new(redeemed, principal_before).publish(&env);
+    }
+
+    /// Admin-only: tighten or relax the target liquid-USDC share of total
+    /// USDC. Same range validation as the constructor (strictly within
+    /// (0, 10000) bps).
+    pub fn set_target_ratio_bps(env: Env, bps: u32) {
+        storage::get_admin(&env).require_auth();
+        assert!(
+            bps > 0 && bps < BPS_DEN as u32,
+            "target_ratio_bps must be in (0, 10000)"
+        );
+        storage::set_target_ratio_bps(&env, bps);
+        ConfigUpdated::new(soroban_sdk::symbol_short!("target"), bps as i128).publish(&env);
+    }
+
+    /// Admin-only: widen or tighten the no-op band around the target. Same
+    /// range as the constructor (`< 10000` bps).
+    pub fn set_rebalance_band_bps(env: Env, bps: u32) {
+        storage::get_admin(&env).require_auth();
+        assert!(bps < BPS_DEN as u32, "rebalance_band_bps must be < 10000");
+        storage::set_rebalance_band_bps(&env, bps);
+        ConfigUpdated::new(soroban_sdk::symbol_short!("band"), bps as i128).publish(&env);
+    }
+
+    /// Admin-only: floor on total pool USDC below which Rebalance is a
+    /// no-op (does not consume cooldown).
+    pub fn set_min_total_usdc(env: Env, amount: i128) {
+        storage::get_admin(&env).require_auth();
+        assert!(amount >= 0, "min_total_usdc must be non-negative");
+        storage::set_min_total_usdc(&env, amount);
+        ConfigUpdated::new(soroban_sdk::symbol_short!("min_tot"), amount).publish(&env);
+    }
+
+    /// Admin-only: minimum seconds between successful Rebalance actions.
+    /// `0` disables the cooldown gate entirely.
+    pub fn set_rebalance_cooldown_secs(env: Env, secs: u64) {
+        storage::get_admin(&env).require_auth();
+        storage::set_rebalance_cooldown_secs(&env, secs);
+        ConfigUpdated::new(soroban_sdk::symbol_short!("cooldown"), secs as i128).publish(&env);
+    }
+
+    /// Admin-only: address that receives BLND emissions on every harvest.
+    /// The handler never holds BLND, so this is a pure routing knob.
+    pub fn set_blnd_treasury(env: Env, treasury: Address) {
+        storage::get_admin(&env).require_auth();
+        storage::set_blnd_treasury(&env, &treasury);
+        AddressConfigUpdated::new(soroban_sdk::symbol_short!("treasury"), treasury).publish(&env);
+    }
+
+    /// Admin-only: id of the (reserve, b-token) pair the handler claims
+    /// BLND emissions against on Blend. Derived from `reserve_index * 2 +
+    /// 1` for the USDC reserve. Must be updated if Blend reconfigures the
+    /// reserve set or the handler is repointed at a new Blend pool.
+    pub fn set_usdc_reserve_token_id(env: Env, id: u32) {
+        storage::get_admin(&env).require_auth();
+        storage::set_usdc_reserve_token_id(&env, id);
+        ConfigUpdated::new(soroban_sdk::symbol_short!("usdc_id"), id as i128).publish(&env);
+    }
+
+    /// Admin-only: view of the current usdc_reserve_token_id (kept here
+    /// since the constructor takes it but there was no view accessor).
+    pub fn usdc_reserve_token_id(env: Env) -> u32 {
+        storage::get_usdc_reserve_token_id(&env)
     }
 }
 
