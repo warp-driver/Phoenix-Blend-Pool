@@ -279,6 +279,7 @@ impl AutomationHandler {
             amount,
         )
         .publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// Admin-only: dust floor below which a Rebalance is a silent no-op
@@ -292,6 +293,7 @@ impl AutomationHandler {
             amount,
         )
         .publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// View: is the handler currently paused?
@@ -306,6 +308,7 @@ impl AutomationHandler {
         storage::get_admin(&env).require_auth();
         storage::set_paused(&env, true);
         PauseToggled::new(true).publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// Admin-only: lift a pause.
@@ -313,6 +316,7 @@ impl AutomationHandler {
         storage::get_admin(&env).require_auth();
         storage::set_paused(&env, false);
         PauseToggled::new(false).publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// Admin-only: drain the entire Blend USDC position back to the pool's
@@ -470,6 +474,7 @@ impl AutomationHandler {
         );
         storage::set_target_ratio_bps(&env, bps);
         ConfigUpdated::new(soroban_sdk::symbol_short!("target"), bps as i128).publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// Admin-only: widen or tighten the no-op band around the target. Same
@@ -479,6 +484,7 @@ impl AutomationHandler {
         assert!(bps < BPS_DEN as u32, "rebalance_band_bps must be < 10000");
         storage::set_rebalance_band_bps(&env, bps);
         ConfigUpdated::new(soroban_sdk::symbol_short!("band"), bps as i128).publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// Admin-only: floor on total pool USDC below which Rebalance is a
@@ -488,6 +494,7 @@ impl AutomationHandler {
         assert!(amount >= 0, "min_total_usdc must be non-negative");
         storage::set_min_total_usdc(&env, amount);
         ConfigUpdated::new(soroban_sdk::symbol_short!("min_tot"), amount).publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// Admin-only: minimum seconds between successful Rebalance actions.
@@ -496,6 +503,7 @@ impl AutomationHandler {
         storage::get_admin(&env).require_auth();
         storage::set_rebalance_cooldown_secs(&env, secs);
         ConfigUpdated::new(soroban_sdk::symbol_short!("cooldown"), secs as i128).publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// Admin-only: address that receives BLND emissions on every harvest.
@@ -504,6 +512,7 @@ impl AutomationHandler {
         storage::get_admin(&env).require_auth();
         storage::set_blnd_treasury(&env, &treasury);
         AddressConfigUpdated::new(soroban_sdk::symbol_short!("treasury"), treasury).publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// Admin-only: id of the (reserve, b-token) pair the handler claims
@@ -514,6 +523,7 @@ impl AutomationHandler {
         storage::get_admin(&env).require_auth();
         storage::set_usdc_reserve_token_id(&env, id);
         ConfigUpdated::new(soroban_sdk::symbol_short!("usdc_id"), id as i128).publish(&env);
+        storage::extend_instance_ttl(&env);
     }
 
     /// Admin-only: view of the current usdc_reserve_token_id (kept here
@@ -817,6 +827,11 @@ fn assert_no_usdc_residue(env: &Env) {
     if bal != 0 {
         soroban_sdk::panic_with_error!(env, crate::error::LocalError::UsdcLeak);
     }
+    // Renew the instance-storage TTL on every successful money-moving
+    // action, defending against an extended dormant period (e.g. quorum
+    // offline for a long time) that would let the contract's instance
+    // storage archive.
+    storage::extend_instance_ttl(env);
 }
 
 fn blend_submit(
