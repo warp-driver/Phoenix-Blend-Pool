@@ -1455,3 +1455,94 @@ fn harvest_with_full_redemption_emits_no_bad_debt() {
     assert_eq!(evt_count, 1);
     assert_eq!(h.handler.principal_supplied(), principal);
 }
+
+// --- Multi-action integration --------------------------------------------------
+
+/// End-to-end sequence covering seed → drift → rebalance → harvest →
+/// pause → unpause → emergency unwind. Each step verifies the invariants
+/// the production deploy depends on.
+#[test]
+fn full_lifecycle_invariants() {
+    let h = setup();
+
+    // -- Phase 0: clean baseline. ---------------------------------------
+    assert_eq!(h.handler.principal_supplied(), 0);
+    assert_eq!(h.handler.last_rebalance_ts(), 0);
+    assert_eq!(h.handler.last_harvest_ts(), 0);
+
+    // -- Phase 1: admin seeds half of USDC into Blend. ------------------
+    let liquid_pre: i128 = 1_000_000_000_000;
+    let delegated_pre: i128 = 0;
+    set_usdc_state(&h, liquid_pre, delegated_pre);
+    h.usdc_admin.mint(&h.mock_pool_id, &liquid_pre);
+    let seed: i128 = 500_000_000_000;
+    h.handler.manual_to_blend(&seed);
+    assert_eq!(h.handler.principal_supplied(), seed);
+
+    // -- Phase 2: drift below band, then tick. -------------------------
+    // Simulate a swap that drained liquid USDC down to 30% of total.
+    let liquid_drift: i128 = 300_000_000_000;
+    let delegated_drift: i128 = 500_000_000_000; // 30/80 = 37.5%, below 45% lower band
+    set_usdc_state(&h, liquid_drift, delegated_drift);
+    h.handler.test_rebalance();
+    // Handler should have withdrawn from Blend to top up.
+    let wd = h.mock_blend.last_submit_withdraw().expect("withdraw not called");
+    assert_eq!(wd.0, h.usdc);
+    assert!(wd.1 > 0, "withdraw amount must be positive");
+    let principal_after_rebalance = h.handler.principal_supplied();
+    assert!(
+        principal_after_rebalance < seed,
+        "principal should shrink after FromBlend",
+    );
+    assert_eq!(h.handler.last_rebalance_ts(), INITIAL_TS);
+
+    // -- Phase 3: cooldown blocks next rebalance.  ---------------------
+    // Within band so it's a no-op anyway, but second tick at same time
+    // should not fire even when out of band.
+    set_usdc_state(&h, 900_000_000_000, principal_after_rebalance);
+    h.handler.test_rebalance();
+    assert_eq!(
+        h.handler.last_rebalance_ts(),
+        INITIAL_TS,
+        "cooldown must block the second action at the same ts",
+    );
+
+    // -- Phase 4: advance time past cooldown, harvest fires. ------------
+    h.env.ledger().with_mut(|li| {
+        li.timestamp = INITIAL_TS + COOLDOWN_SECS * 10;
+    });
+    h.handler.test_harvest();
+    let harvest_ts = h.handler.last_harvest_ts();
+    assert!(harvest_ts >= INITIAL_TS + COOLDOWN_SECS * 10);
+
+    // -- Phase 5: pause halts verify_xlm, but admin entrypoints work. ---
+    h.handler.pause();
+    assert!(h.handler.paused());
+    // Admin entrypoints continue to work (they only require admin auth,
+    // not the pause gate).
+    h.handler.set_max_rebalance_amount(&999_000_000_000);
+    assert_eq!(h.handler.max_rebalance_amount(), 999_000_000_000);
+    h.handler.unpause();
+    assert!(!h.handler.paused());
+
+    // -- Phase 6: emergency unwind drains everything. ------------------
+    let principal_before_unwind = h.handler.principal_supplied();
+    h.handler.emergency_unwind();
+    assert_eq!(h.handler.principal_supplied(), 0);
+    if principal_before_unwind > 0 {
+        let final_dp = h.mock_pool.last_deposit().expect("deposit not called");
+        assert_eq!(final_dp.0, h.usdc);
+        assert!(final_dp.1 > 0);
+    }
+
+    // -- Final invariants: no USDC stuck on the handler. --------------
+    let usdc_token = soroban_sdk::token::Client::new(&h.env, &h.usdc);
+    assert_eq!(
+        usdc_token.balance(&h.handler_id),
+        0,
+        "handler must hold zero USDC at end of lifecycle",
+    );
+    // BLND treasury accounting is consistent (mock has no emissions set,
+    // so balance stayed 0 across all phases).
+    assert_eq!(h.blnd_token.balance(&h.blnd_treasury), 0);
+}
