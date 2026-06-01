@@ -512,3 +512,83 @@ tasks:
             --source "$POOL_ADMIN_SECRET" \
             -- set_delegate --delegate null
         echo "delegate cleared"
+
+  configure-handler:
+    desc: |
+      Apply the full admin-settable policy to a deployed handler in one
+      pass. Idempotent: each setter is independent and emits a
+      ConfigUpdated / AddressConfigUpdated event. Uses HANDLER_ADMIN_SECRET
+      (defaults to DEPLOYER_SECRET) for auth.
+      Reads handler C-address from out/handler.json. Each env knob is
+      optional; omitted setters are skipped.
+    vars:
+      HANDLER_FILE: '{{.HANDLER_FILE | default "out/handler.json"}}'
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
+        HANDLER_ADMIN_SECRET="${HANDLER_ADMIN_SECRET:-$DEPLOYER_SECRET}"
+        HANDLER=$(jq -r .automation_handler "{{.HANDLER_FILE}}")
+        test -n "$HANDLER" && test "$HANDLER" != "null" \
+            || { echo "{{.HANDLER_FILE}} missing automation_handler"; exit 1; }
+
+        invoke() {
+          stellar contract invoke \
+              --id "$HANDLER" \
+              --rpc-url "{{.RPC_URL}}" \
+              --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+              --source "$HANDLER_ADMIN_SECRET" \
+              -- "$@"
+        }
+
+        # Numeric setters. Each tolerates being unset.
+        if [ -n "${TARGET_RATIO_BPS:-}" ]; then
+            echo "set_target_ratio_bps $TARGET_RATIO_BPS"
+            invoke set_target_ratio_bps --bps "$TARGET_RATIO_BPS"
+        fi
+        if [ -n "${REBALANCE_BAND_BPS:-}" ]; then
+            echo "set_rebalance_band_bps $REBALANCE_BAND_BPS"
+            invoke set_rebalance_band_bps --bps "$REBALANCE_BAND_BPS"
+        fi
+        if [ -n "${MIN_TOTAL_USDC:-}" ]; then
+            echo "set_min_total_usdc $MIN_TOTAL_USDC"
+            invoke set_min_total_usdc --amount "$MIN_TOTAL_USDC"
+        fi
+        if [ -n "${MAX_REBALANCE_AMOUNT:-}" ]; then
+            echo "set_max_rebalance_amount $MAX_REBALANCE_AMOUNT"
+            invoke set_max_rebalance_amount --amount "$MAX_REBALANCE_AMOUNT"
+        fi
+        if [ -n "${MIN_REBALANCE_AMOUNT:-}" ]; then
+            echo "set_min_rebalance_amount $MIN_REBALANCE_AMOUNT"
+            invoke set_min_rebalance_amount --amount "$MIN_REBALANCE_AMOUNT"
+        fi
+        if [ -n "${REBALANCE_COOLDOWN_SECS:-}" ]; then
+            echo "set_rebalance_cooldown_secs $REBALANCE_COOLDOWN_SECS"
+            invoke set_rebalance_cooldown_secs --secs "$REBALANCE_COOLDOWN_SECS"
+        fi
+        # Address / id setters.
+        if [ -n "${BLND_TREASURY_OVERRIDE:-}" ]; then
+            echo "set_blnd_treasury $BLND_TREASURY_OVERRIDE"
+            invoke set_blnd_treasury --treasury "$BLND_TREASURY_OVERRIDE"
+        fi
+        if [ -n "${USDC_RESERVE_TOKEN_ID_OVERRIDE:-}" ]; then
+            echo "set_usdc_reserve_token_id $USDC_RESERVE_TOKEN_ID_OVERRIDE"
+            invoke set_usdc_reserve_token_id --id "$USDC_RESERVE_TOKEN_ID_OVERRIDE"
+        fi
+        echo "configuration applied"
+
+  query-handler-state:
+    desc: |
+      Dump the handler's full state snapshot (config + runtime fields) via
+      the query_state view. Useful for dashboards, post-deploy
+      verification, and incident triage.
+    cmds:
+      - |
+        set -euo pipefail
+        HANDLER=$(jq -r .automation_handler out/handler.json)
+        stellar contract invoke \
+            --id "$HANDLER" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "${DEPLOYER_SECRET:-}" \
+            -- query_state
