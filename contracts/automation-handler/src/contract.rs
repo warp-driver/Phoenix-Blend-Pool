@@ -7,7 +7,8 @@ use warpdrive_shared::interfaces::{
     warpdrive::{ContractUpgraded, WarpDriveInterface},
 };
 use crate::events::{
-    ConfigUpdated, HarvestCompleted, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
+    ConfigUpdated, EmergencyUnwound, HarvestCompleted, PauseToggled, RebalanceExecuted,
+    DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
 };
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
@@ -102,6 +103,13 @@ impl AutomationHandler {
         envelope_bytes: Bytes,
         sig_data: Ed25519SignatureData,
     ) -> Result<(), HandlerError> {
+        if storage::get_paused(&env) {
+            // Project-local panic with code 600. The Result<(), HandlerError>
+            // signature is preserved; the panic short-circuits the call and
+            // surfaces in the tx diagnostic with a precise reason.
+            soroban_sdk::panic_with_error!(&env, crate::error::LocalError::Paused);
+        }
+
         let envelope = XlmEnvelope::from_xdr(&env, &envelope_bytes)
             .map_err(|_| HandlerError::InvalidEnvelope)?;
         let event_id = envelope.event_id.clone();
@@ -214,6 +222,75 @@ impl AutomationHandler {
             amount,
         )
         .publish(&env);
+    }
+
+    /// View: is the handler currently paused?
+    pub fn paused(env: Env) -> bool {
+        storage::get_paused(&env)
+    }
+
+    /// Admin-only: pause the handler. `verify_xlm` panics with `LocalError::Paused`
+    /// (code 600) while paused; the envelope is NOT marked seen, so a
+    /// re-submission after `unpause` will proceed normally.
+    pub fn pause(env: Env) {
+        storage::get_admin(&env).require_auth();
+        storage::set_paused(&env, true);
+        PauseToggled::new(true).publish(&env);
+    }
+
+    /// Admin-only: lift a pause.
+    pub fn unpause(env: Env) {
+        storage::get_admin(&env).require_auth();
+        storage::set_paused(&env, false);
+        PauseToggled::new(false).publish(&env);
+    }
+
+    /// Admin-only: drain the entire Blend USDC position back to the pool's
+    /// liquid balance, bypassing cooldown / band / scope-limit gating.
+    ///
+    /// Operationally this is the off-ramp when Blend's status goes Frozen,
+    /// when the operator network is paused but funds need to come home, or
+    /// when migrating to a new handler.
+    ///
+    /// Mechanic:
+    ///   1. `Blend.submit(Withdraw, USDC, i128::MAX)` → handler holds USDC.
+    ///   2. Deposit `min(redeemed, principal_before)` back via
+    ///      `deposit_from_delegate`; this matches the pool's
+    ///      `delegated_out_*` counter so the call doesn't underflow.
+    ///   3. Donate any excess (accrued interest) to the pool via `donate`.
+    ///   4. Reset `principal_supplied = 0`.
+    pub fn emergency_unwind(env: Env) {
+        storage::get_admin(&env).require_auth();
+
+        let blend_pool = storage::get_blend_pool(&env);
+        let blended_pool = storage::get_blended_pool(&env);
+        let usdc = storage::get_usdc(&env);
+        let principal_before = storage::get_principal_supplied(&env);
+
+        let mut redeemed: i128 = 0;
+        if principal_before > 0 {
+            let usdc_token = soroban_sdk::token::Client::new(&env, &usdc);
+            let before = usdc_token.balance(&env.current_contract_address());
+            blend_submit(&env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, i128::MAX);
+            redeemed = usdc_token
+                .balance(&env.current_contract_address())
+                .saturating_sub(before);
+
+            if redeemed > 0 {
+                let pool_client = BlendedPoolClient::new(&env, &blended_pool);
+                let deposit_amount = redeemed.min(principal_before);
+                if deposit_amount > 0 {
+                    pool_client.deposit_from_delegate(&usdc, &deposit_amount);
+                }
+                let donate_amount = redeemed.saturating_sub(principal_before);
+                if donate_amount > 0 {
+                    pool_client.donate(&usdc, &donate_amount);
+                }
+            }
+        }
+
+        storage::set_principal_supplied(&env, 0);
+        EmergencyUnwound::new(redeemed, principal_before).publish(&env);
     }
 }
 

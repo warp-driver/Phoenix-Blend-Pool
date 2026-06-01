@@ -851,3 +851,154 @@ fn negative_max_rebalance_amount_rejected() {
     let h = setup();
     h.handler.set_max_rebalance_amount(&-1);
 }
+
+// --- Pause / unpause tests ---------------------------------------------------
+
+#[test]
+fn paused_defaults_to_false() {
+    let h = setup();
+    assert!(!h.handler.paused());
+}
+
+#[test]
+fn admin_pause_unpause_round_trip() {
+    let h = setup();
+
+    h.handler.pause();
+    assert!(h.handler.paused());
+
+    h.handler.unpause();
+    assert!(!h.handler.paused());
+}
+
+#[test]
+fn pause_blocks_test_paths_via_verify_xlm_only() {
+    // The test-only `test_rebalance` / `test_harvest` entrypoints bypass
+    // `verify_xlm` and therefore the pause gate — this is intentional
+    // (the test harness drives the executors directly). The pause check
+    // is only exercised on the production `verify_xlm` path. This test
+    // documents that contract.
+    let h = setup();
+    h.handler.pause();
+
+    // test_rebalance still runs because it bypasses verify_xlm.
+    set_usdc_state(&h, 520_000_000_000, 480_000_000_000);
+    h.handler.test_rebalance(); // does not panic; pause only gates verify_xlm
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #600)")]
+fn verify_xlm_panics_when_paused() {
+    use soroban_sdk::Bytes;
+    let h = setup();
+    h.handler.pause();
+
+    // Build a minimum-shaped sig data; the pause check runs before any
+    // envelope decoding, so the bytes don't have to validate.
+    let envelope = Bytes::new(&h.env);
+    let signers: soroban_sdk::Vec<soroban_sdk::BytesN<32>> = soroban_sdk::Vec::new(&h.env);
+    let signatures: soroban_sdk::Vec<soroban_sdk::BytesN<64>> = soroban_sdk::Vec::new(&h.env);
+    let sig = crate::Ed25519SignatureData {
+        signers,
+        signatures,
+        reference_block: 0,
+    };
+    h.handler.verify_xlm(&envelope, &sig);
+}
+
+// --- Emergency unwind tests --------------------------------------------------
+
+#[test]
+fn emergency_unwind_happy_path() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    seed_blend_supply(&h, principal);
+
+    h.handler.emergency_unwind();
+
+    let wd = h.mock_blend.last_submit_withdraw().expect("withdraw not called");
+    assert_eq!(wd.0, h.usdc);
+    let dp = h.mock_pool.last_deposit().expect("deposit not called");
+    assert_eq!(dp, (h.usdc.clone(), principal));
+    assert_eq!(h.handler.principal_supplied(), 0);
+    assert!(h.mock_pool.last_donate().is_none());
+}
+
+#[test]
+fn emergency_unwind_with_interest_donates_excess() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    let interest: i128 = 2_500_000_000;
+    seed_blend_supply(&h, principal);
+    h.usdc_admin.mint(&h.mock_blend_id, &interest);
+    h.mock_blend.set_redeemable(&(principal + interest));
+
+    h.handler.emergency_unwind();
+
+    let dp = h.mock_pool.last_deposit().expect("deposit not called");
+    assert_eq!(dp, (h.usdc.clone(), principal));
+    let donate = h.mock_pool.last_donate().expect("donate not called");
+    assert_eq!(donate, (h.usdc.clone(), interest));
+    assert_eq!(h.handler.principal_supplied(), 0);
+}
+
+#[test]
+fn emergency_unwind_under_bad_debt() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    let redeemable: i128 = 60_000_000_000;
+    seed_blend_supply(&h, principal);
+    h.mock_blend.set_redeemable(&redeemable);
+
+    h.handler.emergency_unwind();
+
+    let dp = h.mock_pool.last_deposit().expect("deposit not called");
+    assert_eq!(dp, (h.usdc.clone(), redeemable));
+    assert_eq!(h.handler.principal_supplied(), 0);
+    assert!(h.mock_pool.last_donate().is_none());
+}
+
+#[test]
+fn emergency_unwind_with_zero_principal_is_no_op() {
+    let h = setup();
+    assert_eq!(h.handler.principal_supplied(), 0);
+
+    h.handler.emergency_unwind();
+    // env.events().all() reflects only the LAST invocation; snapshot it
+    // before any further contract call would overwrite the log.
+    let from_handler = h.env.events().all().filter_by_contract(&h.handler_id);
+    assert!(
+        !from_handler.events().is_empty(),
+        "event must be emitted even when principal_supplied == 0",
+    );
+
+    assert_eq!(h.handler.principal_supplied(), 0);
+    assert!(h.mock_blend.last_submit_withdraw().is_none());
+    assert!(h.mock_pool.last_deposit().is_none());
+}
+
+#[test]
+fn emergency_unwind_bypasses_pause() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    seed_blend_supply(&h, principal);
+    h.handler.pause();
+
+    h.handler.emergency_unwind();
+
+    assert_eq!(h.handler.principal_supplied(), 0);
+    let dp = h.mock_pool.last_deposit().expect("deposit not called");
+    assert_eq!(dp, (h.usdc.clone(), principal));
+}
+
+#[test]
+fn emergency_unwind_bypasses_cooldown() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    seed_blend_supply(&h, principal);
+    h.handler.test_set_last_rebalance_ts(&(INITIAL_TS - 5));
+
+    h.handler.emergency_unwind();
+
+    assert_eq!(h.handler.principal_supplied(), 0);
+}
