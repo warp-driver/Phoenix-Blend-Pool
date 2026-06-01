@@ -105,6 +105,19 @@ tasks:
     cmds:
       - cargo test --manifest-path components/circuit/Cargo.toml --lib
 
+  test-aggregator:
+    desc: Run blend-rebalance-aggregator unit tests.
+    cmds:
+      - cargo test --manifest-path components/aggregator/Cargo.toml --lib
+
+  test:
+    desc: |
+      Run the full local test matrix - contracts, circuit, aggregator.
+      Single command for CI and pre-commit gating. Does NOT exercise the
+      pool_blended fork (that lives in `../phoenix-contracts` and ships
+      its own test runner).
+    deps: [test-handler, test-circuit, test-aggregator]
+
   build-handler:
     desc: Build automation-handler Soroban contract.
     cmds:

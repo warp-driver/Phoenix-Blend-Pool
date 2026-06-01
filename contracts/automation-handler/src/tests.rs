@@ -28,7 +28,9 @@ use crate::externals::{
 const TARGET_BPS: u32 = 5_000; // 50%
 const BAND_BPS: u32 = 500; // +/- 5%
 const MIN_TOTAL_USDC: i128 = 1_000_000_000; // 100 USDC at 7 decimals
+#[allow(dead_code)]
 const MAX_REBALANCE_AMOUNT: i128 = 0; // unlimited (0 sentinel)
+#[allow(dead_code)]
 const MIN_REBALANCE_AMOUNT: i128 = 0; // no dust floor
 const COOLDOWN_SECS: u64 = 60;
 const USDC_RESERVE_TOKEN_ID: u32 = 1;
