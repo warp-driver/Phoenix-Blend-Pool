@@ -470,3 +470,45 @@ tasks:
         curl -sSf -X POST "http://127.0.0.1:8000/dev/services/$HASH" \
             -o /dev/null
         echo "service registered with dispatcher"
+
+  set-delegate:
+    desc: |
+      Wire the deployed automation-handler as the blended pool's delegate.
+      Reads handler C-address from out/handler.json and calls
+      pool_blended.set_delegate(handler) on BLENDED_POOL using
+      POOL_ADMIN_SECRET (which defaults to DEPLOYER_SECRET if the pool
+      admin is the same key). This step is mandatory between
+      `task deploy` and any operator-driven event flow.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
+        POOL_ADMIN_SECRET="${POOL_ADMIN_SECRET:-$DEPLOYER_SECRET}"
+        HANDLER=$(jq -r .automation_handler out/handler.json)
+        test -n "$HANDLER" && test "$HANDLER" != "null" \
+            || { echo "out/handler.json missing automation_handler"; exit 1; }
+        echo "wiring $HANDLER as delegate on {{.BLENDED_POOL}}"
+        stellar contract invoke \
+            --id "{{.BLENDED_POOL}}" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$POOL_ADMIN_SECRET" \
+            -- set_delegate --delegate "$HANDLER"
+        echo "delegate wired"
+
+  unset-delegate:
+    desc: |
+      Emergency: clear the blended pool's delegate (set to None). Stops any
+      further delegate-gated calls into the pool until a new delegate is
+      registered. Use during a handler migration or active incident.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${POOL_ADMIN_SECRET:?POOL_ADMIN_SECRET is required to clear delegate}"
+        stellar contract invoke \
+            --id "{{.BLENDED_POOL}}" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$POOL_ADMIN_SECRET" \
+            -- set_delegate --delegate null
+        echo "delegate cleared"
