@@ -1292,3 +1292,29 @@ fn manual_from_blend_rejects_overdraw() {
     set_usdc_state(&h, 400_000_000_000, principal);
     h.handler.manual_from_blend(&(principal + 1));
 }
+
+// --- last_harvest_ts tracking ------------------------------------------------
+
+#[test]
+fn last_harvest_ts_defaults_to_zero() {
+    let h = setup();
+    assert_eq!(h.handler.last_harvest_ts(), 0);
+}
+
+#[test]
+fn harvest_updates_last_harvest_ts() {
+    let h = setup();
+    h.handler.test_harvest();
+    assert_eq!(h.handler.last_harvest_ts(), INITIAL_TS);
+}
+
+#[test]
+fn last_harvest_ts_unchanged_by_rebalance() {
+    let h = setup();
+    let liquid: i128 = 700_000_000_000;
+    let delegated: i128 = 300_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.usdc_admin.mint(&h.mock_pool_id, &liquid);
+    h.handler.test_rebalance();
+    assert_eq!(h.handler.last_harvest_ts(), 0, "rebalance must not touch last_harvest_ts");
+}

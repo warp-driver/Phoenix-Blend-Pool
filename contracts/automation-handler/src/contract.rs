@@ -202,6 +202,10 @@ impl AutomationHandler {
         storage::get_last_rebalance_ts(&env)
     }
 
+    pub fn last_harvest_ts(env: Env) -> u64 {
+        storage::get_last_harvest_ts(&env)
+    }
+
     pub fn payload(_env: Env, _event_id: BytesN<20>) -> Option<Bytes> {
         None
     }
@@ -519,6 +523,10 @@ impl AutomationHandler {
     pub fn test_set_last_rebalance_ts(env: Env, ts: u64) {
         storage::set_last_rebalance_ts(&env, ts);
     }
+
+    pub fn test_set_last_harvest_ts(env: Env, ts: u64) {
+        storage::set_last_harvest_ts(&env, ts);
+    }
 }
 
 /// Read the blended pool's delegate state and, if drift from the configured
@@ -715,6 +723,7 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
         }
     }
 
+    storage::set_last_harvest_ts(env, env.ledger().timestamp());
     HarvestCompleted::new(interest_donated, blnd_routed, principal_after).publish(env);
 
     Ok(())

@@ -19,6 +19,7 @@ pub enum DataKey {
     MinRebalanceAmount,
     RebalanceCooldownSecs,
     LastRebalanceTs,
+    LastHarvestTs,
     Paused,
     Version,
     EventSeen(BytesN<20>),
@@ -192,6 +193,22 @@ pub fn get_last_rebalance_ts(env: &Env) -> u64 {
     env.storage()
         .instance()
         .get(&DataKey::LastRebalanceTs)
+        .unwrap_or(0)
+}
+
+/// Ledger timestamp of the last successful HarvestYield. Dashboards use
+/// this to assert the cron tick is firing on schedule; defaults to `0`
+/// (never harvested) so a fresh deploy reads naturally.
+pub fn set_last_harvest_ts(env: &Env, ts: u64) {
+    env.storage()
+        .instance()
+        .set(&DataKey::LastHarvestTs, &ts);
+}
+
+pub fn get_last_harvest_ts(env: &Env) -> u64 {
+    env.storage()
+        .instance()
+        .get(&DataKey::LastHarvestTs)
         .unwrap_or(0)
 }
 
