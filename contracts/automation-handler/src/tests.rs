@@ -1403,3 +1403,55 @@ fn happy_path_leaves_no_residue() {
         "handler must hold no USDC after a clean rebalance",
     );
 }
+
+// --- Bad-debt detection -----------------------------------------------------
+
+#[test]
+fn harvest_under_bad_debt_emits_event_and_shrinks_principal() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    let redeemable: i128 = 70_000_000_000; // 30% write-down
+    seed_blend_supply(&h, principal);
+    h.mock_blend.set_redeemable(&redeemable);
+
+    h.handler.test_harvest();
+    // events().all() reflects the LAST invocation; snapshot it before any
+    // further handler call resets the log.
+    let evt_count = h
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&h.handler_id)
+        .events()
+        .len();
+
+    assert_eq!(h.handler.principal_supplied(), redeemable);
+    // Expect at least 2 handler events: HarvestCompleted + BadDebtDetected.
+    // (Both fire on the same call so the event log holds them together.)
+    assert!(
+        evt_count >= 2,
+        "expected HarvestCompleted + BadDebtDetected events, got {}",
+        evt_count,
+    );
+}
+
+#[test]
+fn harvest_with_full_redemption_emits_no_bad_debt() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    seed_blend_supply(&h, principal);
+    // No override => redeem exactly principal (happy path).
+
+    h.handler.test_harvest();
+    let evt_count = h
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&h.handler_id)
+        .events()
+        .len();
+
+    // Only HarvestCompleted should fire.
+    assert_eq!(evt_count, 1);
+    assert_eq!(h.handler.principal_supplied(), principal);
+}

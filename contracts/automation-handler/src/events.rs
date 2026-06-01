@@ -125,6 +125,28 @@ impl AddressConfigUpdated {
     }
 }
 
+/// Emitted whenever `principal_supplied` shrinks because Blend redeemed
+/// fewer USDC than the handler accounts for. The shortfall is exactly
+/// `previous_principal - redeemable`. Monitoring dashboards SHOULD alert
+/// on this event since it indicates Blend recorded a bad-debt write-down
+/// against the handler's b-token position.
+#[contractevent]
+pub struct BadDebtDetected {
+    pub previous_principal: i128,
+    pub redeemable: i128,
+    pub shortfall: i128,
+}
+
+impl BadDebtDetected {
+    pub fn new(previous_principal: i128, redeemable: i128, shortfall: i128) -> Self {
+        Self {
+            previous_principal,
+            redeemable,
+            shortfall,
+        }
+    }
+}
+
 /// Re-export `Env` for compatibility; not strictly needed but keeps the
 /// publish-call sites readable when the caller already has `env` in scope.
 #[allow(dead_code)]

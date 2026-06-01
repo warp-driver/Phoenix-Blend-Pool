@@ -7,8 +7,8 @@ use warpdrive_shared::interfaces::{
     warpdrive::{ContractUpgraded, WarpDriveInterface},
 };
 use crate::events::{
-    AddressConfigUpdated, ConfigUpdated, EmergencyUnwound, HarvestCompleted, PauseToggled,
-    RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
+    AddressConfigUpdated, BadDebtDetected, ConfigUpdated, EmergencyUnwound, HarvestCompleted,
+    PauseToggled, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
 };
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
@@ -775,6 +775,19 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
         }
         storage::set_principal_supplied(env, supply_amount);
         principal_after = supply_amount;
+
+        // Bad-debt detection: if Blend redeemed less than the handler's
+        // recorded principal, the b-token position has been written down.
+        // Emit a high-signal event for monitoring; the handler proceeds
+        // with the smaller principal (silent correction; not a panic).
+        if actual_redeemable < principal {
+            BadDebtDetected::new(
+                principal,
+                actual_redeemable,
+                principal - actual_redeemable,
+            )
+            .publish(env);
+        }
 
         let interest = actual_redeemable.saturating_sub(supply_amount);
         if interest > 0 {
