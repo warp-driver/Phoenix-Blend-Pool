@@ -592,3 +592,65 @@ tasks:
             --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
             --source "${DEPLOYER_SECRET:-}" \
             -- query_state
+
+  verify-deploy:
+    desc: |
+      Post-deploy sanity check. Pulls query_state from the deployed
+      handler, asserts the on-chain values match the env-configured
+      addresses, and confirms `pool_blended.set_delegate` ran. Exits
+      non-zero on any mismatch; safe to chain into CI.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
+        HANDLER=$(jq -r .automation_handler out/handler.json)
+        test -n "$HANDLER" && test "$HANDLER" != "null" \
+            || { echo "out/handler.json missing automation_handler"; exit 1; }
+
+        STATE=$(stellar contract invoke \
+            --id "$HANDLER" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$DEPLOYER_SECRET" \
+            -- query_state)
+        echo "$STATE" | jq .
+
+        check() {
+          local field="$1" expected="$2"
+          local actual
+          actual=$(printf '%s' "$STATE" | jq -r ".$field")
+          if [ "$actual" != "$expected" ]; then
+            echo "MISMATCH $field: on-chain=$actual expected=$expected"
+            exit 1
+          fi
+          echo "ok   $field=$actual"
+        }
+
+        check blended_pool   "{{.BLENDED_POOL}}"
+        check blend_pool     "{{.BLEND_POOL}}"
+        check usdc           "{{.USDC}}"
+        check xlm            "{{.XLM}}"
+        check blnd_treasury  "{{.BLND_TREASURY}}"
+        check usdc_reserve_token_id "{{.USDC_RESERVE_TOKEN_ID}}"
+        check target_ratio_bps "{{.TARGET_RATIO_BPS}}"
+        check rebalance_band_bps "{{.REBALANCE_BAND_BPS}}"
+        check min_total_usdc "{{.MIN_TOTAL_USDC}}"
+        check rebalance_cooldown_secs "{{.REBALANCE_COOLDOWN_SECS}}"
+        check paused         "false"
+
+        # Pool-side check: delegate must equal the handler.
+        DELEGATE=$(stellar contract invoke \
+            --id "{{.BLENDED_POOL}}" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$DEPLOYER_SECRET" \
+            -- query_delegate_state | jq -r .delegate)
+        if [ "$DELEGATE" != "$HANDLER" ]; then
+          echo "MISMATCH pool.delegate: on-chain=$DELEGATE expected=$HANDLER"
+          echo "Did you forget \`task set-delegate\`?"
+          exit 1
+        fi
+        echo "ok   pool.delegate=$HANDLER"
+
+        echo
+        echo "verify-deploy: all checks passed"
