@@ -8,8 +8,7 @@ pub enum DataKey {
     BlendPool,
     Usdc,
     Xlm,
-    Blnd,
-    BlndSwapPool,
+    BlndTreasury,
     UsdcReserveTokenId,
     PrincipalSupplied,
     TargetRatioBps,
@@ -53,12 +52,11 @@ address_accessors!(
 );
 address_accessors!(get_usdc, set_usdc, DataKey::Usdc, "usdc not set");
 address_accessors!(get_xlm, set_xlm, DataKey::Xlm, "xlm not set");
-address_accessors!(get_blnd, set_blnd, DataKey::Blnd, "blnd not set");
 address_accessors!(
-    get_blnd_swap_pool,
-    set_blnd_swap_pool,
-    DataKey::BlndSwapPool,
-    "blnd swap pool not set"
+    get_blnd_treasury,
+    set_blnd_treasury,
+    DataKey::BlndTreasury,
+    "blnd treasury not set"
 );
 
 pub fn set_usdc_reserve_token_id(env: &Env, id: u32) {

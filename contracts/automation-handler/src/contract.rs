@@ -7,8 +7,7 @@ use warpdrive_shared::interfaces::{
 };
 
 use crate::externals::{
-    BlendPoolClient, BlendRequest, BlendedPoolClient, LegacyPoolClient, BLEND_REQUEST_SUPPLY,
-    BLEND_REQUEST_WITHDRAW,
+    BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
 };
 use crate::storage;
 
@@ -53,8 +52,7 @@ impl AutomationHandler {
         blend_pool: Address,
         usdc: Address,
         xlm: Address,
-        blnd: Address,
-        blnd_swap_pool: Address,
+        blnd_treasury: Address,
         usdc_reserve_token_id: u32,
         target_ratio_bps: u32,
         rebalance_band_bps: u32,
@@ -76,8 +74,7 @@ impl AutomationHandler {
         storage::set_blend_pool(&env, &blend_pool);
         storage::set_usdc(&env, &usdc);
         storage::set_xlm(&env, &xlm);
-        storage::set_blnd(&env, &blnd);
-        storage::set_blnd_swap_pool(&env, &blnd_swap_pool);
+        storage::set_blnd_treasury(&env, &blnd_treasury);
         storage::set_usdc_reserve_token_id(&env, usdc_reserve_token_id);
         storage::set_target_ratio_bps(&env, target_ratio_bps);
         storage::set_rebalance_band_bps(&env, rebalance_band_bps);
@@ -157,6 +154,10 @@ impl AutomationHandler {
 
     pub fn principal_supplied(env: Env) -> i128 {
         storage::get_principal_supplied(&env)
+    }
+
+    pub fn blnd_treasury(env: Env) -> Address {
+        storage::get_blnd_treasury(&env)
     }
 
     pub fn rebalance_cooldown_secs(env: Env) -> u64 {
@@ -282,88 +283,58 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
     Ok(())
 }
 
-/// Yield-harvest: pull accrued BLND emissions + USDC interest, donate to LPs.
+/// Yield-harvest: route BLND emissions to the treasury, peel off USDC
+/// interest from the b-token position, donate the interest to LPs.
 ///
 /// Mechanic:
-///   1. Claim BLND emissions for our USDC supply position.
-///   2. Swap any BLND received -> USDC on the configured BLND-USDC pool.
-///   3. Withdraw everything from Blend (Blend treats i128::MAX as "all
-///      available"), then re-supply `principal_supplied`. The leftover USDC
-///      is exactly the accrued interest delta.
-///   4. Donate the combined (BLND-swap-proceeds + interest) USDC to the
-///      blended pool, distributing pro-rata to LP holders without minting.
+///   1. `Blend.claim(..., to=blnd_treasury)` routes BLND straight to the
+///      configured treasury. The handler never holds BLND, which removes any
+///      dependency on an external BLND-USDC swap venue and keeps the harvest
+///      path pure-USDC.
+///   2. Withdraw everything from Blend (`i128::MAX` is Blend's "all
+///      redeemable" sentinel), then re-supply the smaller of `principal` and
+///      the actual redeemable amount. In the happy case `actual_redeemable
+///      == principal + interest`, so we re-supply `principal` and the
+///      `interest` delta stays as USDC on the handler. In a bad-debt
+///      write-down case `actual_redeemable < principal`, we re-supply
+///      everything we got back and shrink `principal_supplied` to match the
+///      new on-chain position.
+///   3. Donate the interest delta to the blended pool, distributing pro-rata
+///      to LP holders without minting LP tokens.
 fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
     let blend_pool = storage::get_blend_pool(env);
-    let blnd_swap_pool = storage::get_blnd_swap_pool(env);
+    let blnd_treasury = storage::get_blnd_treasury(env);
     let blended_pool = storage::get_blended_pool(env);
     let usdc = storage::get_usdc(env);
-    let blnd = storage::get_blnd(env);
     let usdc_reserve_token_id = storage::get_usdc_reserve_token_id(env);
     let principal = storage::get_principal_supplied(env);
 
-    let usdc_token = soroban_sdk::token::Client::new(env, &usdc);
-    let usdc_start = usdc_token.balance(&env.current_contract_address());
-
-    // 1. Claim BLND emissions for our USDC supply position. May return 0.
+    // 1. Route BLND emissions straight to the treasury.
     let blend = BlendPoolClient::new(env, &blend_pool);
     let mut ids: Vec<u32> = Vec::new(env);
     ids.push_back(usdc_reserve_token_id);
-    blend.claim(
-        &env.current_contract_address(),
-        &ids,
-        &env.current_contract_address(),
-    );
+    blend.claim(&env.current_contract_address(), &ids, &blnd_treasury);
 
-    // 2. Swap any BLND we just received -> USDC. Skip if zero.
-    let blnd_token = soroban_sdk::token::Client::new(env, &blnd);
-    let blnd_balance = blnd_token.balance(&env.current_contract_address());
-    if blnd_balance > 0 {
-        let blnd_pool = LegacyPoolClient::new(env, &blnd_swap_pool);
-        let _ = blnd_pool.swap(
-            &env.current_contract_address(),
-            &blnd,
-            &blnd_balance,
-            &None::<i128>,
-            &Some(10_000i64),
-            &None::<u64>,
-            &None::<i64>,
-        );
-    }
-
-    // 3. Withdraw-all from Blend, then re-supply only what was actually
-    //    redeemable. In the happy case actual_redeemable = principal +
-    //    accrued_interest, so we re-supply `principal` and leave the
-    //    accrued_interest as part of `total_yield`. In a bad-debt write-down
-    //    case actual_redeemable < principal, so we re-supply everything we
-    //    got back and shrink `principal_supplied` to match the new on-chain
-    //    position. Without this clamp, the unconditional `Supply(principal)`
-    //    would request more USDC than we hold, reverting the whole harvest
-    //    and stranding the (now-fully-withdrawn) position outside Blend.
+    // 2 + 3. Peel off USDC interest, then donate it.
     if principal > 0 {
+        let usdc_token = soroban_sdk::token::Client::new(env, &usdc);
         let usdc_before_withdraw = usdc_token.balance(&env.current_contract_address());
         blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, i128::MAX);
-        let usdc_after_withdraw = usdc_token.balance(&env.current_contract_address());
-        let actual_redeemable = usdc_after_withdraw.saturating_sub(usdc_before_withdraw);
+        let actual_redeemable = usdc_token
+            .balance(&env.current_contract_address())
+            .saturating_sub(usdc_before_withdraw);
 
         let supply_amount = principal.min(actual_redeemable);
         if supply_amount > 0 {
             blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, supply_amount);
         }
-        // principal_supplied tracks the position currently in Blend. In the
-        // happy case this re-sets it to the same value; in a write-down case
-        // it shrinks to actual_redeemable.
         storage::set_principal_supplied(env, supply_amount);
-    }
 
-    // 4. Total yield = USDC balance delta over the whole flow = BLND swap
-    //    proceeds + interest. Donate to LPs (no-op if zero or somehow negative
-    //    - the latter would indicate a Blend bad-debt write-down).
-    let usdc_end = usdc_token.balance(&env.current_contract_address());
-    let total_yield = usdc_end.saturating_sub(usdc_start);
-
-    if total_yield > 0 {
-        let pool_client = BlendedPoolClient::new(env, &blended_pool);
-        pool_client.donate(&usdc, &total_yield);
+        let interest = actual_redeemable.saturating_sub(supply_amount);
+        if interest > 0 {
+            let pool_client = BlendedPoolClient::new(env, &blended_pool);
+            pool_client.donate(&usdc, &interest);
+        }
     }
 
     Ok(())

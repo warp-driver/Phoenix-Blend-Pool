@@ -2,11 +2,15 @@
 //!
 //! These tests bypass the envelope/signature path via the `#[cfg(test)]`
 //! `test_rebalance` / `test_harvest` entrypoints and exercise the core
-//! executor logic against mock implementations of the three external
-//! contracts the handler talks to (the blended pool, the Blend lending pool,
-//! and the BLND-USDC swap pool). All token movements use real
-//! StellarAssetContract instances so balance assertions reflect actual
-//! transfers.
+//! executor logic against mock implementations of the two external
+//! contracts the handler talks to: the blended pool and the Blend lending
+//! pool. All token movements use real `StellarAssetContract` instances so
+//! balance assertions reflect actual transfers.
+//!
+//! The handler does NOT swap BLND in this design. BLND emissions are routed
+//! straight from `Blend.claim(..., to=blnd_treasury)`, so the handler never
+//! holds BLND. The tests verify BLND lands in the treasury and the USDC
+//! interest portion lands in the pool via `donate`.
 
 extern crate alloc;
 
@@ -41,9 +45,6 @@ const KEY_REDEEM: Symbol = symbol_short!("REDEEM");
 const KEY_SUPPLIED: Symbol = symbol_short!("SUPPLIED");
 const KEY_SUP_CALL: Symbol = symbol_short!("SUPCALL");
 const KEY_WD_CALL: Symbol = symbol_short!("WDCALL");
-const KEY_ASK: Symbol = symbol_short!("ASK");
-const KEY_RATE: Symbol = symbol_short!("RATE");
-const KEY_SWAP: Symbol = symbol_short!("SWAP");
 
 // --- MockBlendedPool ---------------------------------------------------------
 //
@@ -60,7 +61,6 @@ impl MockBlendedPool {
     pub fn __constructor(env: Env, usdc: Address, xlm: Address) {
         env.storage().instance().set(&KEY_USDC, &usdc);
         env.storage().instance().set(&KEY_XLM, &xlm);
-        // Initial state is all zeros; tests override via set_state.
         let zero = DelegateState {
             delegate: None,
             liquid_a: 0,
@@ -96,8 +96,6 @@ impl MockBlendedPool {
         env.storage().instance().get(&KEY_DONATE)
     }
 
-    // BlendedPool trait surface (matches the contractclient-generated signatures).
-
     pub fn withdraw_to_delegate(env: Env, token: Address, amount: i128) {
         let delegate: Address = env.storage().instance().get(&KEY_DELEG).expect("no delegate");
         token::Client::new(&env, &token).transfer(
@@ -105,9 +103,7 @@ impl MockBlendedPool {
             &delegate,
             &amount,
         );
-        env.storage()
-            .instance()
-            .set(&KEY_WD, &(token, amount));
+        env.storage().instance().set(&KEY_WD, &(token, amount));
     }
 
     pub fn deposit_from_delegate(env: Env, token: Address, amount: i128) {
@@ -117,9 +113,7 @@ impl MockBlendedPool {
             &env.current_contract_address(),
             &amount,
         );
-        env.storage()
-            .instance()
-            .set(&KEY_DP, &(token, amount));
+        env.storage().instance().set(&KEY_DP, &(token, amount));
     }
 
     pub fn donate(env: Env, token: Address, amount: i128) {
@@ -129,9 +123,7 @@ impl MockBlendedPool {
             &env.current_contract_address(),
             &amount,
         );
-        env.storage()
-            .instance()
-            .set(&KEY_DONATE, &(token, amount));
+        env.storage().instance().set(&KEY_DONATE, &(token, amount));
     }
 
     pub fn query_delegate_state(env: Env) -> DelegateState {
@@ -142,10 +134,10 @@ impl MockBlendedPool {
 // --- MockBlendPool -----------------------------------------------------------
 //
 // Stand-in for the Blend lending pool. Implements `submit` (Supply / Withdraw)
-// and `claim` (BLND emissions). Supply transfers from caller to mock; Withdraw
-// transfers from mock back, capped at the supplied amount or the test-set
-// `redeemable` override (used to simulate a bad-debt write-down). Claim pays
-// out a test-set BLND amount.
+// and `claim` (BLND emissions transferred to the configured `to` address;
+// the handler passes blnd_treasury). Supply transfers from caller to mock;
+// Withdraw transfers from mock back, capped at the supplied amount or the
+// test-set `redeemable` override (used to simulate a bad-debt write-down).
 
 #[contract]
 pub struct MockBlendPool;
@@ -162,9 +154,8 @@ impl MockBlendPool {
         env.storage().instance().set(&KEY_CLAIM_AMT, &amount);
     }
 
-    /// Override the redeemable amount on `Withdraw(i128::MAX)`. If unset
-    /// (or set to a negative sentinel via this not being called), Withdraw
-    /// returns the currently-supplied amount (happy path).
+    /// Override the redeemable amount on `Withdraw(i128::MAX)`. If unset,
+    /// Withdraw returns the currently-supplied amount (happy path).
     /// Used to simulate bad-debt: redeemable < supplied principal.
     pub fn set_redeemable(env: Env, amount: i128) {
         env.storage().instance().set(&KEY_REDEEM, &amount);
@@ -211,10 +202,6 @@ impl MockBlendPool {
                 let redeem_override: Option<i128> =
                     env.storage().instance().get(&KEY_REDEEM);
                 let to_withdraw = if req.amount == i128::MAX {
-                    // "Withdraw all" sentinel: use the override if set
-                    // (simulating bad-debt), else return the full supplied
-                    // balance (happy path with interest accounted by the
-                    // mock_blnd_pool externally via direct mint).
                     redeem_override.unwrap_or(supplied)
                 } else {
                     req.amount.min(supplied)
@@ -258,60 +245,6 @@ impl MockBlendPool {
     }
 }
 
-// --- MockLegacyPool (BLND-USDC swap) -----------------------------------------
-//
-// Stand-in for the Phoenix BLND-USDC pool used by HarvestYield to convert
-// claimed BLND emissions to USDC. Implements only `swap` and pays out at a
-// configurable rate (default 1:1).
-
-#[contract]
-pub struct MockLegacyPool;
-
-#[contractimpl]
-impl MockLegacyPool {
-    pub fn __constructor(env: Env, ask_token: Address) {
-        env.storage().instance().set(&KEY_ASK, &ask_token);
-        env.storage().instance().set(&KEY_RATE, &1i128);
-    }
-
-    pub fn set_rate(env: Env, rate: i128) {
-        env.storage().instance().set(&KEY_RATE, &rate);
-    }
-
-    pub fn last_swap(env: Env) -> Option<(Address, i128, i128)> {
-        env.storage().instance().get(&KEY_SWAP)
-    }
-
-    pub fn swap(
-        env: Env,
-        sender: Address,
-        offer_asset: Address,
-        offer_amount: i128,
-        _ask_asset_min_amount: Option<i128>,
-        _max_spread_bps: Option<i64>,
-        _deadline: Option<u64>,
-        _max_allowed_fee_bps: Option<i64>,
-    ) -> i128 {
-        let ask: Address = env.storage().instance().get(&KEY_ASK).unwrap();
-        let rate: i128 = env.storage().instance().get(&KEY_RATE).unwrap_or(1);
-        token::Client::new(&env, &offer_asset).transfer(
-            &sender,
-            &env.current_contract_address(),
-            &offer_amount,
-        );
-        let ask_amount = offer_amount * rate;
-        token::Client::new(&env, &ask).transfer(
-            &env.current_contract_address(),
-            &sender,
-            &ask_amount,
-        );
-        env.storage()
-            .instance()
-            .set(&KEY_SWAP, &(offer_asset, offer_amount, ask_amount));
-        ask_amount
-    }
-}
-
 // --- Setup -------------------------------------------------------------------
 
 struct Harness<'a> {
@@ -322,14 +255,14 @@ struct Harness<'a> {
     mock_pool_id: Address,
     mock_blend: MockBlendPoolClient<'a>,
     mock_blend_id: Address,
-    mock_swap: MockLegacyPoolClient<'a>,
-    mock_swap_id: Address,
     usdc: Address,
     xlm: Address,
     #[allow(dead_code)]
     blnd: Address,
+    blnd_treasury: Address,
     usdc_admin: token::StellarAssetClient<'a>,
     blnd_admin: token::StellarAssetClient<'a>,
+    blnd_token: token::Client<'a>,
 }
 
 fn setup() -> Harness<'static> {
@@ -347,11 +280,14 @@ fn setup() -> Harness<'static> {
     let blnd = blnd_sac.address();
     let usdc_admin = token::StellarAssetClient::new(&env, &usdc);
     let blnd_admin = token::StellarAssetClient::new(&env, &blnd);
+    let blnd_token = token::Client::new(&env, &blnd);
 
     let mock_pool_id = env.register(MockBlendedPool, (usdc.clone(), xlm.clone()));
     let mock_blend_id = env.register(MockBlendPool, (blnd.clone(),));
-    // BLND-USDC swap pool: offer BLND, get USDC back.
-    let mock_swap_id = env.register(MockLegacyPool, (usdc.clone(),));
+
+    // Treasury that receives BLND emissions. A plain generated address; tests
+    // read its BLND balance directly.
+    let blnd_treasury = Address::generate(&env);
 
     let verification = Address::generate(&env);
 
@@ -363,8 +299,7 @@ fn setup() -> Harness<'static> {
             mock_blend_id.clone(),
             usdc.clone(),
             xlm.clone(),
-            blnd.clone(),
-            mock_swap_id.clone(),
+            blnd_treasury.clone(),
             USDC_RESERVE_TOKEN_ID,
             TARGET_BPS,
             BAND_BPS,
@@ -375,10 +310,8 @@ fn setup() -> Harness<'static> {
 
     let mock_pool = MockBlendedPoolClient::new(&env, &mock_pool_id);
     let mock_blend = MockBlendPoolClient::new(&env, &mock_blend_id);
-    let mock_swap = MockLegacyPoolClient::new(&env, &mock_swap_id);
     let handler = AutomationHandlerClient::new(&env, &handler_id);
 
-    // Register the handler as the blended pool's delegate so transfers route.
     mock_pool.set_delegate(&handler_id);
 
     Harness {
@@ -389,26 +322,20 @@ fn setup() -> Harness<'static> {
         mock_pool_id,
         mock_blend,
         mock_blend_id,
-        mock_swap,
-        mock_swap_id,
         usdc,
         xlm,
         blnd,
+        blnd_treasury,
         usdc_admin,
         blnd_admin,
+        blnd_token,
     }
 }
 
-/// USDC sorts AFTER XLM by strkey, so in the pool's a/b layout XLM = a, USDC = b.
-/// (Both are random SAC addresses in tests; we still derive which side USDC is
-/// on the same way the handler does, by lexicographic compare.)
 fn usdc_is_a(h: &Harness) -> bool {
     h.usdc < h.xlm
 }
 
-/// Configure the mock pool to report a `DelegateState` where USDC has the
-/// given liquid/delegated/total breakdown. XLM amounts are kept fixed and
-/// irrelevant to the handler's USDC-only ratio math.
 fn set_usdc_state(h: &Harness, liquid: i128, delegated: i128) {
     let total = liquid + delegated;
     let dummy_xlm: i128 = 999_999_999_999;
@@ -440,11 +367,8 @@ fn set_usdc_state(h: &Harness, liquid: i128, delegated: i128) {
 
 #[test]
 fn rebalance_to_blend_above_band_moves_excess() {
-    // Total USDC = 100k, liquid = 70k, delegated = 30k.
-    // target_liquid = 50k. band = 5k. upper = 55k. liquid 70k > 55k.
-    // Action: withdraw (70k - 50k) = 20k from pool, supply to Blend.
     let h = setup();
-    let liquid: i128 = 700_000_000_000; // 70k USDC at 7 decimals
+    let liquid: i128 = 700_000_000_000;
     let delegated: i128 = 300_000_000_000;
     set_usdc_state(&h, liquid, delegated);
     h.usdc_admin.mint(&h.mock_pool_id, &liquid);
@@ -462,43 +386,21 @@ fn rebalance_to_blend_above_band_moves_excess() {
 
 #[test]
 fn rebalance_from_blend_below_band_pulls_topup() {
-    // Total = 100k, liquid = 30k, delegated = 70k. target = 50k. lower = 45k.
-    // liquid 30k < 45k. Action: withdraw (50k - 30k) = 20k from Blend,
-    // deposit_from_delegate back into the pool.
     let h = setup();
     let liquid: i128 = 300_000_000_000;
     let delegated: i128 = 700_000_000_000;
     set_usdc_state(&h, liquid, delegated);
-    // The pool needs to be configured with the principal already supplied to
-    // Blend so the cap-at-principal sanity guard doesn't clamp the pull.
     h.handler.test_set_principal_supplied(&delegated);
-    // Mock Blend needs the principal balance on hand to return on withdraw.
     h.usdc_admin.mint(&h.mock_blend_id, &delegated);
-    // Mock Blend's bookkeeping needs to know the position size too. We
-    // simulate that by recording it as if a prior ToBlend had run; the
-    // simplest way is to call the mock's submit Supply path. But we cannot
-    // call submit without first having a USDC source on the handler. The
-    // cleaner shortcut is set_redeemable on the mock so Withdraw(i128::MAX)
-    // would work, but the handler asks for a specific amount here, not MAX.
-    // So we instead pre-supply the mock by minting + calling submit through
-    // a separate driver. Easiest: bump the mock's `supplied` ledger via a
-    // setter. We don't have one, so call submit through the mock_blend
-    // client directly.
-    // (We use a no-op driver: mint to handler, then call the mock through a
-    // proxy that supplies it. But mock_blend.submit is the real entry. Just
-    // use it directly with the harness deployer auth.)
+    let stash = Address::generate(&h.env);
+    h.usdc_admin.mint(&stash, &delegated);
     let mut requests: Vec<BlendRequest> = Vec::new(&h.env);
     requests.push_back(BlendRequest {
         request_type: BLEND_REQUEST_SUPPLY,
         address: h.usdc.clone(),
         amount: delegated,
     });
-    // Supplier needs balance: mint a separate stash, then call submit.
-    let stash = Address::generate(&h.env);
-    h.usdc_admin.mint(&stash, &delegated);
     h.mock_blend.submit(&stash, &stash, &stash, &requests);
-    // Now the mock's supplied ledger shows `delegated` for USDC. Reset the
-    // last-call markers so the rebalance-driven Withdraw is what we observe.
 
     h.handler.test_rebalance();
 
@@ -513,7 +415,6 @@ fn rebalance_from_blend_below_band_pulls_topup() {
 
 #[test]
 fn rebalance_within_band_is_no_op() {
-    // liquid = 52k, target = 50k, band = 5k. drift inside band. No-op.
     let h = setup();
     set_usdc_state(&h, 520_000_000_000, 480_000_000_000);
 
@@ -524,17 +425,13 @@ fn rebalance_within_band_is_no_op() {
     assert!(h.mock_blend.last_submit_supply().is_none());
     assert!(h.mock_blend.last_submit_withdraw().is_none());
     assert_eq!(h.handler.principal_supplied(), 0);
-    // last_rebalance_ts is NOT bumped on a no-op so a subsequent real drift
-    // event isn't gated by the cooldown.
     assert_eq!(h.handler.last_rebalance_ts(), 0);
 }
 
 #[test]
 fn rebalance_below_min_total_is_no_op() {
-    // Total = 50 USDC, well below the 100 USDC min_total floor. No-op even
-    // when drift would otherwise breach the band.
     let h = setup();
-    set_usdc_state(&h, 100_000_000, 400_000_000); // 10 + 40 = 50 USDC
+    set_usdc_state(&h, 100_000_000, 400_000_000);
 
     h.handler.test_rebalance();
 
@@ -546,23 +443,19 @@ fn rebalance_below_min_total_is_no_op() {
 
 #[test]
 fn rebalance_under_cooldown_is_no_op() {
-    // Run one real rebalance, then immediately try another. The second
-    // attempt is within the 60s cooldown so it should be a no-op.
     let h = setup();
     set_usdc_state(&h, 700_000_000_000, 300_000_000_000);
     h.usdc_admin.mint(&h.mock_pool_id, &700_000_000_000);
 
-    h.handler.test_rebalance(); // populates last_rebalance_ts = INITIAL_TS
+    h.handler.test_rebalance();
     let principal_after_first = h.handler.principal_supplied();
     assert!(principal_after_first > 0);
 
-    // Drift the pool again immediately. Cooldown should suppress.
     set_usdc_state(&h, 800_000_000_000, 200_000_000_000);
-    h.env.ledger().set_timestamp(INITIAL_TS + 30); // 30s < 60s cooldown
+    h.env.ledger().set_timestamp(INITIAL_TS + 30);
 
     h.handler.test_rebalance();
 
-    // principal_supplied unchanged from first run.
     assert_eq!(h.handler.principal_supplied(), principal_after_first);
 }
 
@@ -575,7 +468,6 @@ fn rebalance_after_cooldown_acts_again() {
     h.handler.test_rebalance();
     let principal_after_first = h.handler.principal_supplied();
 
-    // Beyond cooldown. Drift again.
     h.env.ledger().set_timestamp(INITIAL_TS + COOLDOWN_SECS + 1);
     set_usdc_state(&h, 700_000_000_000, 300_000_000_000);
     h.usdc_admin.mint(&h.mock_pool_id, &200_000_000_000);
@@ -588,14 +480,12 @@ fn rebalance_after_cooldown_acts_again() {
 
 #[test]
 fn rebalance_from_blend_caps_at_principal() {
-    // Pool says delegated_b = 70k but principal_supplied = 10k. Mocked
-    // bad-state guard: only pull 10k (the actually-recoverable principal).
     let h = setup();
     let liquid: i128 = 300_000_000_000;
     let delegated_in_pool: i128 = 700_000_000_000;
     set_usdc_state(&h, liquid, delegated_in_pool);
 
-    let small_principal: i128 = 100_000_000_000; // 10k
+    let small_principal: i128 = 100_000_000_000;
     h.handler.test_set_principal_supplied(&small_principal);
     h.usdc_admin.mint(&h.mock_blend_id, &small_principal);
     let stash = Address::generate(&h.env);
@@ -619,8 +509,9 @@ fn rebalance_from_blend_caps_at_principal() {
 
 // --- Harvest tests -----------------------------------------------------------
 
-/// Seed the Blend mock with a USDC supply position. Returns the supplied
-/// amount for convenience.
+/// Seed the Blend mock with a USDC supply position. Sets the handler's
+/// `principal_supplied` accounting to match, and drives a real Supply call on
+/// the mock so its internal `supplied_amount` ledger is consistent.
 fn seed_blend_supply(h: &Harness, amount: i128) {
     h.handler.test_set_principal_supplied(&amount);
     let stash = Address::generate(&h.env);
@@ -635,51 +526,63 @@ fn seed_blend_supply(h: &Harness, amount: i128) {
 }
 
 #[test]
-fn harvest_happy_path_donates_interest_plus_blnd_swap_proceeds() {
-    // Position: 100 USDC principal supplied. Blend has 102 USDC redeemable
-    // (2% interest). BLND emissions = 5 BLND, swap pool returns USDC at 2:1
-    // (so 5 BLND -> 10 USDC). Total donation = 2 (interest) + 10 (BLND swap)
-    // = 12 USDC.
+fn harvest_happy_path_donates_interest_only() {
+    // Position: 100 USDC supplied. Blend has 102 USDC redeemable (2% interest).
+    // No BLND emissions. Expected: re-supply 100, donate 2 USDC, principal
+    // unchanged.
     let h = setup();
     let principal: i128 = 100_000_000_000;
     let interest: i128 = 2_000_000_000;
-    let blnd_emissions: i128 = 50_000_000_000;
-    let swap_rate: i128 = 2;
 
     seed_blend_supply(&h, principal);
-    // Top up the mock blend's USDC reserve so it can return principal+interest.
     h.usdc_admin.mint(&h.mock_blend_id, &interest);
     h.mock_blend.set_redeemable(&(principal + interest));
 
-    // Mint BLND into mock_blend to back the claim; configure claim amount.
-    h.blnd_admin.mint(&h.mock_blend_id, &blnd_emissions);
-    h.mock_blend.set_claim_amount(&blnd_emissions);
-
-    // Mint USDC into mock_swap so it can pay out the swap proceeds.
-    h.usdc_admin
-        .mint(&h.mock_swap_id, &(blnd_emissions * swap_rate));
-    h.mock_swap.set_rate(&swap_rate);
-
-    // Move ledger time forward so cooldown isn't relevant (harvest is not
-    // gated by it anyway, but keeps the test honest).
     h.env.ledger().set_timestamp(INITIAL_TS + 3600);
 
     h.handler.test_harvest();
 
     let donate = h.mock_pool.last_donate().expect("donate not called");
-    let expected = interest + blnd_emissions * swap_rate;
-    assert_eq!(donate, (h.usdc.clone(), expected));
+    assert_eq!(donate, (h.usdc.clone(), interest));
+    assert_eq!(h.handler.principal_supplied(), principal);
 
-    // principal_supplied is reset to the same `principal` in the happy case
-    // (interest peeled off, principal re-supplied).
+    // BLND treasury balance is zero because no emissions were configured.
+    assert_eq!(h.blnd_token.balance(&h.blnd_treasury), 0);
+}
+
+#[test]
+fn harvest_routes_blnd_emissions_to_treasury() {
+    // Position: 100 USDC + 50 BLND emissions accruable + 2 USDC interest.
+    // Expected: BLND lands in the treasury, USDC interest lands as donate.
+    // Handler holds NEITHER BLND nor USDC after the harvest.
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    let interest: i128 = 2_000_000_000;
+    let blnd_emissions: i128 = 50_000_000_000;
+
+    seed_blend_supply(&h, principal);
+    h.usdc_admin.mint(&h.mock_blend_id, &interest);
+    h.mock_blend.set_redeemable(&(principal + interest));
+    h.blnd_admin.mint(&h.mock_blend_id, &blnd_emissions);
+    h.mock_blend.set_claim_amount(&blnd_emissions);
+
+    h.handler.test_harvest();
+
+    // BLND was routed directly to the treasury, NOT to the handler.
+    assert_eq!(h.blnd_token.balance(&h.blnd_treasury), blnd_emissions);
+    assert_eq!(h.blnd_token.balance(&h.handler_id), 0);
+
+    // USDC interest lands as a donate.
+    let donate = h.mock_pool.last_donate().expect("donate not called");
+    assert_eq!(donate, (h.usdc.clone(), interest));
     assert_eq!(h.handler.principal_supplied(), principal);
 }
 
 #[test]
-fn harvest_bad_debt_shrinks_principal_and_donates_only_blnd() {
-    // Position: 100 USDC principal. Blend has been written down: only 70
-    // USDC redeemable. No BLND emissions. Expected: re-supply 70 (not 100),
-    // principal_supplied = 70, donate = 0 (no positive yield).
+fn harvest_bad_debt_shrinks_principal_no_donate() {
+    // Position: 100 USDC principal. Blend wrote down: only 70 redeemable.
+    // Expected: re-supply 70, principal_supplied = 70, no donate (interest
+    // delta is 0 since we re-supplied everything that came back).
     let h = setup();
     let principal: i128 = 100_000_000_000;
     let redeemable: i128 = 70_000_000_000;
@@ -689,73 +592,59 @@ fn harvest_bad_debt_shrinks_principal_and_donates_only_blnd() {
 
     h.handler.test_harvest();
 
-    // Re-supply was for the smaller actual_redeemable, not the stale principal.
     let sup = h.mock_blend.last_submit_supply().expect("Supply not called");
     assert_eq!(sup, (h.usdc.clone(), redeemable));
-    // principal_supplied shrunk to the new position size.
     assert_eq!(h.handler.principal_supplied(), redeemable);
-    // No donate because the USDC delta is 0 (we re-supplied everything that
-    // came back; no BLND emissions either).
     assert!(h.mock_pool.last_donate().is_none());
 }
 
 #[test]
-fn harvest_bad_debt_with_blnd_still_donates_blnd_proceeds() {
-    // Bad-debt write-down (70/100 redeemable) but BLND emissions are non-zero,
-    // so the donate amount equals the BLND swap proceeds even though no
-    // interest is extractable.
+fn harvest_bad_debt_still_routes_blnd_to_treasury() {
+    // Bad-debt write-down zeros out the interest donate but BLND emissions
+    // still route to the treasury. Verifies the two paths are independent.
     let h = setup();
     let principal: i128 = 100_000_000_000;
     let redeemable: i128 = 70_000_000_000;
     let blnd_emissions: i128 = 10_000_000_000;
-    let swap_rate: i128 = 3;
 
     seed_blend_supply(&h, principal);
     h.mock_blend.set_redeemable(&redeemable);
     h.blnd_admin.mint(&h.mock_blend_id, &blnd_emissions);
     h.mock_blend.set_claim_amount(&blnd_emissions);
-    h.usdc_admin
-        .mint(&h.mock_swap_id, &(blnd_emissions * swap_rate));
-    h.mock_swap.set_rate(&swap_rate);
 
     h.handler.test_harvest();
 
-    let donate = h.mock_pool.last_donate().expect("donate not called");
-    assert_eq!(donate, (h.usdc.clone(), blnd_emissions * swap_rate));
+    assert_eq!(h.blnd_token.balance(&h.blnd_treasury), blnd_emissions);
+    assert!(h.mock_pool.last_donate().is_none());
     assert_eq!(h.handler.principal_supplied(), redeemable);
 }
 
 #[test]
 fn harvest_zero_principal_skips_withdraw_resupply() {
-    // No position in Blend. Harvest should still claim emissions (here 0) and
-    // donate any USDC sitting on the handler (here 0). Effectively a no-op.
+    // No position in Blend. Harvest claims emissions (here 0) and that's it.
     let h = setup();
-    // principal_supplied starts at 0 from the constructor.
+
     h.handler.test_harvest();
 
     assert!(h.mock_blend.last_submit_supply().is_none());
     assert!(h.mock_blend.last_submit_withdraw().is_none());
     assert!(h.mock_pool.last_donate().is_none());
     assert_eq!(h.handler.principal_supplied(), 0);
+    assert_eq!(h.blnd_token.balance(&h.blnd_treasury), 0);
 }
 
 #[test]
-fn harvest_zero_blnd_emissions_still_donates_pure_interest() {
-    // No BLND emitted this cycle, but interest is real.
+fn harvest_zero_principal_still_routes_blnd_to_treasury() {
+    // No USDC position but BLND emissions claimable from a prior cycle.
+    // The treasury still receives BLND; no donate happens.
     let h = setup();
-    let principal: i128 = 50_000_000_000;
-    let interest: i128 = 1_000_000_000;
-
-    seed_blend_supply(&h, principal);
-    h.usdc_admin.mint(&h.mock_blend_id, &interest);
-    h.mock_blend.set_redeemable(&(principal + interest));
-    // No claim amount set -> claim returns 0, no swap happens.
+    let blnd_emissions: i128 = 5_000_000_000;
+    h.blnd_admin.mint(&h.mock_blend_id, &blnd_emissions);
+    h.mock_blend.set_claim_amount(&blnd_emissions);
 
     h.handler.test_harvest();
 
-    // mock_swap.last_swap should be unset since no BLND swap fired.
-    assert!(h.mock_swap.last_swap().is_none());
-    let donate = h.mock_pool.last_donate().expect("donate not called");
-    assert_eq!(donate, (h.usdc.clone(), interest));
-    assert_eq!(h.handler.principal_supplied(), principal);
+    assert_eq!(h.blnd_token.balance(&h.blnd_treasury), blnd_emissions);
+    assert!(h.mock_pool.last_donate().is_none());
+    assert_eq!(h.handler.principal_supplied(), 0);
 }

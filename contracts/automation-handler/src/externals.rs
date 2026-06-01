@@ -31,21 +31,7 @@ pub trait BlendedPool {
     fn query_delegate_state(env: Env) -> DelegateState;
 }
 
-// --- Phoenix legacy pool (existing XLM-USDC, used as XLM<->USDC swap venue) ---
 
-#[contractclient(name = "LegacyPoolClient")]
-pub trait LegacyPool {
-    fn swap(
-        env: Env,
-        sender: Address,
-        offer_asset: Address,
-        offer_amount: i128,
-        ask_asset_min_amount: Option<i128>,
-        max_spread_bps: Option<i64>,
-        deadline: Option<u64>,
-        max_allowed_fee_bps: Option<i64>,
-    ) -> i128;
-}
 
 // --- Blend lending pool ---
 //

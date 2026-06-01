@@ -21,13 +21,12 @@ WarpDrive operators sign the envelope; the **aggregator** (`components/aggregato
 
     XLM never moves. Spec calls for 50% of *USDC* in Blend; the XLM side stays fully liquid in the Phoenix pool.
 
-- **`HarvestYield`** (cron-triggered) - pulls accrued yield from both Blend sources and donates it pro-rata to LPs:
-    1. `Blend.claim(...)` for BLND emissions on the USDC supply position.
-    2. If BLND received, swap BLND -> USDC on the configured BLND-USDC pool.
-    3. `Blend.submit(Withdraw, USDC, i128::MAX)` to pull everything (principal + interest), then re-supply `principal_supplied` to restore the position. The leftover USDC is exactly the accrued interest delta.
-    4. `blended_pool.donate(USDC, total_yield)` distributes the combined (BLND-swap-proceeds + interest) to LP holders without minting LP tokens.
+- **`HarvestYield`** (cron-triggered) - claim BLND emissions to a treasury, peel off USDC interest from the b-token position, donate the interest to LPs:
+    1. `Blend.claim(..., to=blnd_treasury)` routes BLND straight to the configured treasury address. The handler never holds BLND, which removes any dependency on an external BLND-USDC swap venue and keeps the harvest path pure-USDC.
+    2. `Blend.submit(Withdraw, USDC, i128::MAX)` to pull everything (principal + interest). Re-supply the smaller of `principal_supplied` and the actual redeemable amount (which handles Blend bad-debt write-downs without reverting).
+    3. `blended_pool.donate(USDC, interest)` distributes the accrued USDC interest pro-rata to LP holders without minting LP tokens.
 
-    `principal_supplied` is tracked on the handler across the Rebalance lifecycle so HarvestYield can isolate just the interest portion without ever reading the b-rate.
+    `principal_supplied` is tracked on the handler across the Rebalance lifecycle so HarvestYield can isolate just the interest portion without ever reading the b-rate. Whoever owns the treasury (Phoenix DAO multisig, a buyback contract, future vote-escrow contract) decides separately what to do with accumulated BLND.
 
 The handler is the address configured as the blended pool's delegate via `set_delegate(...)`.
 

@@ -54,8 +54,11 @@ vars:
   BLEND_POOL: '{{.BLEND_POOL | default "CDVQVKOY2YSXS2IC7KN6MNASSHPAO7UN2UR2ON4OI2SKMFJNVAMDX6DP"}}'
   USDC: '{{.USDC | default "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"}}'
   XLM: '{{.XLM | default "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA"}}'
-  BLND: '{{.BLND | default "CD25MNVTZDL4Y3XBCPCJXGXATV5WUHHOWMYFF4YBEGU5FCPGMYTVG5JY"}}'
-  BLND_SWAP_POOL: '{{.BLND_SWAP_POOL | default "CB000000000000000000000000000000000000000000000000000000"}}'
+  # BLND_TREASURY receives BLND emissions claimed during HarvestYield.
+  # The handler routes claim(... to=blnd_treasury) directly; the handler
+  # never holds BLND. Default placeholder; override per deploy with the
+  # Phoenix/Blend-coordinated treasury address (DAO multisig, etc).
+  BLND_TREASURY: '{{.BLND_TREASURY | default "CB000000000000000000000000000000000000000000000000000000"}}'
   USDC_RESERVE_TOKEN_ID: '{{.USDC_RESERVE_TOKEN_ID | default "1"}}'
   # Rebalance policy (handler constructor args). target = 50% (5000 bps),
   # band = +/- 5% (500 bps), min total USDC below which Rebalance is a no-op
@@ -240,7 +243,7 @@ tasks:
   deploy-handler:
     desc: |
       Deploy automation-handler. Reads verification contract from
-      out/deploy.json; takes blended_pool/blend_pool/usdc/xlm/blnd and the
+      out/deploy.json; takes blended_pool/blend_pool/usdc/xlm/blnd_treasury and the
       rebalance policy (target/band/min) from task vars (overrideable via
       env). Writes out/handler.json.
     deps: [build-handler]
@@ -261,8 +264,7 @@ tasks:
             --blend_pool "{{.BLEND_POOL}}" \
             --usdc "{{.USDC}}" \
             --xlm "{{.XLM}}" \
-            --blnd "{{.BLND}}" \
-            --blnd_swap_pool "{{.BLND_SWAP_POOL}}" \
+            --blnd_treasury "{{.BLND_TREASURY}}" \
             --usdc_reserve_token_id "{{.USDC_RESERVE_TOKEN_ID}}" \
             --target_ratio_bps "{{.TARGET_RATIO_BPS}}" \
             --rebalance_band_bps "{{.REBALANCE_BAND_BPS}}" \
