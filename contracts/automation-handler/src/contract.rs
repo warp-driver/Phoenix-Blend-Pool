@@ -6,7 +6,9 @@ use warpdrive_shared::interfaces::{
     verification::Ed25519VerificationClient,
     warpdrive::{ContractUpgraded, WarpDriveInterface},
 };
-
+use crate::events::{
+    HarvestCompleted, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
+};
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
 };
@@ -286,6 +288,8 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         .ok_or(HandlerError::OtherInvocationError)?;
     let lower = target_liquid.saturating_sub(band);
 
+    let delegated_before = total_usdc - liquid_usdc;
+
     if liquid_usdc > upper {
         // Pool is over-liquid in USDC - supply the excess to Blend.
         let amount = liquid_usdc
@@ -294,12 +298,19 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         pool_client.withdraw_to_delegate(&usdc, &amount);
         blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, amount);
         let prev = storage::get_principal_supplied(env);
-        storage::set_principal_supplied(
-            env,
-            prev.checked_add(amount)
-                .ok_or(HandlerError::OtherInvocationError)?,
-        );
+        let principal_after = prev
+            .checked_add(amount)
+            .ok_or(HandlerError::OtherInvocationError)?;
+        storage::set_principal_supplied(env, principal_after);
         storage::set_last_rebalance_ts(env, now);
+        RebalanceExecuted::new(
+            DIRECTION_TO_BLEND,
+            amount,
+            liquid_usdc - amount,
+            delegated_before + amount,
+            principal_after,
+        )
+        .publish(env);
     } else if liquid_usdc < lower {
         // Pool is under-liquid in USDC - pull from Blend to top up.
         let mut amount = target_liquid
@@ -316,8 +327,17 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         if amount > 0 {
             blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, amount);
             pool_client.deposit_from_delegate(&usdc, &amount);
-            storage::set_principal_supplied(env, (principal - amount).max(0));
+            let principal_after = (principal - amount).max(0);
+            storage::set_principal_supplied(env, principal_after);
             storage::set_last_rebalance_ts(env, now);
+            RebalanceExecuted::new(
+                DIRECTION_FROM_BLEND,
+                amount,
+                liquid_usdc + amount,
+                delegated_before - amount,
+                principal_after,
+            )
+            .publish(env);
         }
     }
     // Inside the band: no-op.
@@ -350,13 +370,16 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
     let usdc_reserve_token_id = storage::get_usdc_reserve_token_id(env);
     let principal = storage::get_principal_supplied(env);
 
-    // 1. Route BLND emissions straight to the treasury.
+    // 1. Route BLND emissions straight to the treasury. `claim` returns the
+    //    amount transferred to `to`; capture it for the HarvestCompleted event.
     let blend = BlendPoolClient::new(env, &blend_pool);
     let mut ids: Vec<u32> = Vec::new(env);
     ids.push_back(usdc_reserve_token_id);
-    blend.claim(&env.current_contract_address(), &ids, &blnd_treasury);
+    let blnd_routed = blend.claim(&env.current_contract_address(), &ids, &blnd_treasury);
 
     // 2 + 3. Peel off USDC interest, then donate it.
+    let mut interest_donated: i128 = 0;
+    let mut principal_after = principal;
     if principal > 0 {
         let usdc_token = soroban_sdk::token::Client::new(env, &usdc);
         let usdc_before_withdraw = usdc_token.balance(&env.current_contract_address());
@@ -370,13 +393,17 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
             blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, supply_amount);
         }
         storage::set_principal_supplied(env, supply_amount);
+        principal_after = supply_amount;
 
         let interest = actual_redeemable.saturating_sub(supply_amount);
         if interest > 0 {
             let pool_client = BlendedPoolClient::new(env, &blended_pool);
             pool_client.donate(&usdc, &interest);
+            interest_donated = interest;
         }
     }
+
+    HarvestCompleted::new(interest_donated, blnd_routed, principal_after).publish(env);
 
     Ok(())
 }

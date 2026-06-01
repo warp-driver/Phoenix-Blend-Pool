@@ -14,7 +14,7 @@
 
 extern crate alloc;
 
-use soroban_sdk::testutils::{Address as _, Ledger as _};
+use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::{
     contract, contractimpl, symbol_short, token, Address, Env, Map, Symbol, Vec,
 };
@@ -690,4 +690,55 @@ fn admin_transfer_happy_path() {
 fn accept_admin_without_proposal_panics() {
     let h = setup();
     h.handler.accept_admin();
+}
+
+// --- Event emission tests ----------------------------------------------------
+
+#[test]
+fn rebalance_emits_rebalance_executed_event() {
+    let h = setup();
+    let liquid: i128 = 700_000_000_000;
+    let delegated: i128 = 300_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.usdc_admin.mint(&h.mock_pool_id, &liquid);
+
+    h.handler.test_rebalance();
+
+    let from_handler = h.env.events().all().filter_by_contract(&h.handler_id);
+    assert!(
+        !from_handler.events().is_empty(),
+        "handler must emit a RebalanceExecuted event on an action",
+    );
+}
+
+#[test]
+fn no_event_emitted_on_within_band_rebalance() {
+    let h = setup();
+    set_usdc_state(&h, 520_000_000_000, 480_000_000_000);
+
+    h.handler.test_rebalance();
+
+    let from_handler = h.env.events().all().filter_by_contract(&h.handler_id);
+    assert!(
+        from_handler.events().is_empty(),
+        "no-op rebalance must not emit any handler event",
+    );
+}
+
+#[test]
+fn harvest_emits_harvest_completed_event() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    let interest: i128 = 2_000_000_000;
+    seed_blend_supply(&h, principal);
+    h.usdc_admin.mint(&h.mock_blend_id, &interest);
+    h.mock_blend.set_redeemable(&(principal + interest));
+
+    h.handler.test_harvest();
+
+    let from_handler = h.env.events().all().filter_by_contract(&h.handler_id);
+    assert!(
+        !from_handler.events().is_empty(),
+        "handler must emit HarvestCompleted on every harvest tick",
+    );
 }
