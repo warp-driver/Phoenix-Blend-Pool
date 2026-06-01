@@ -1318,3 +1318,51 @@ fn last_harvest_ts_unchanged_by_rebalance() {
     h.handler.test_rebalance();
     assert_eq!(h.handler.last_harvest_ts(), 0, "rebalance must not touch last_harvest_ts");
 }
+
+// --- Aggregate query_state view ----------------------------------------------
+
+#[test]
+fn query_state_returns_consistent_snapshot() {
+    let h = setup();
+    let s = h.handler.query_state();
+
+    assert_eq!(s.admin, h.handler_admin);
+    assert!(s.pending_admin.is_none());
+    assert_eq!(s.blended_pool, h.mock_pool_id);
+    assert_eq!(s.blend_pool, h.mock_blend_id);
+    assert_eq!(s.usdc, h.usdc);
+    assert_eq!(s.xlm, h.xlm);
+    assert_eq!(s.blnd_treasury, h.blnd_treasury);
+    assert_eq!(s.usdc_reserve_token_id, USDC_RESERVE_TOKEN_ID);
+    assert_eq!(s.target_ratio_bps, TARGET_BPS);
+    assert_eq!(s.rebalance_band_bps, BAND_BPS);
+    assert_eq!(s.min_total_usdc, MIN_TOTAL_USDC);
+    assert_eq!(s.max_rebalance_amount, 0);
+    assert_eq!(s.min_rebalance_amount, 0);
+    assert_eq!(s.rebalance_cooldown_secs, COOLDOWN_SECS);
+    assert_eq!(s.principal_supplied, 0);
+    assert_eq!(s.last_rebalance_ts, 0);
+    assert_eq!(s.last_harvest_ts, 0);
+    assert!(!s.paused);
+    assert_eq!(
+        s.version,
+        soroban_sdk::String::from_str(&h.env, env!("CARGO_PKG_VERSION")),
+    );
+}
+
+#[test]
+fn query_state_reflects_runtime_changes() {
+    let h = setup();
+    h.handler.pause();
+    h.handler.set_max_rebalance_amount(&123_000_000_000);
+    h.handler.test_set_principal_supplied(&77_000_000_000);
+
+    let new_admin = Address::generate(&h.env);
+    h.handler.propose_admin(&new_admin);
+
+    let s = h.handler.query_state();
+    assert!(s.paused);
+    assert_eq!(s.max_rebalance_amount, 123_000_000_000);
+    assert_eq!(s.principal_supplied, 77_000_000_000);
+    assert_eq!(s.pending_admin, Some(new_admin));
+}

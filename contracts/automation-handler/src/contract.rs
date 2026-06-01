@@ -52,6 +52,34 @@ pub enum RebalanceAction {
     HarvestYield,
 }
 
+/// Snapshot of the handler's full configuration + runtime state, returned
+/// by `query_state()` as a single read. Dashboards and monitoring tools
+/// consume this instead of paying one cross-contract call per field.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct HandlerState {
+    pub admin: Address,
+    pub pending_admin: Option<Address>,
+    pub verification_contract: Address,
+    pub blended_pool: Address,
+    pub blend_pool: Address,
+    pub usdc: Address,
+    pub xlm: Address,
+    pub blnd_treasury: Address,
+    pub usdc_reserve_token_id: u32,
+    pub target_ratio_bps: u32,
+    pub rebalance_band_bps: u32,
+    pub min_total_usdc: i128,
+    pub max_rebalance_amount: i128,
+    pub min_rebalance_amount: i128,
+    pub rebalance_cooldown_secs: u64,
+    pub principal_supplied: i128,
+    pub last_rebalance_ts: u64,
+    pub last_harvest_ts: u64,
+    pub paused: bool,
+    pub version: String,
+}
+
 #[contract]
 pub struct AutomationHandler;
 
@@ -206,6 +234,35 @@ impl AutomationHandler {
         storage::get_last_harvest_ts(&env)
     }
 
+
+    /// Dashboard-friendly aggregate view. Returns every config + runtime
+    /// field in one read, eliminating ~18 separate cross-contract calls
+    /// the dashboard would otherwise need. The shape is stable across
+    /// upgrades; new fields are appended, never reordered or removed.
+    pub fn query_state(env: Env) -> HandlerState {
+        HandlerState {
+            admin: storage::get_admin(&env),
+            pending_admin: warpdrive_shared::admin::pending(&env),
+            verification_contract: storage::get_verification_contract(&env),
+            blended_pool: storage::get_blended_pool(&env),
+            blend_pool: storage::get_blend_pool(&env),
+            usdc: storage::get_usdc(&env),
+            xlm: storage::get_xlm(&env),
+            blnd_treasury: storage::get_blnd_treasury(&env),
+            usdc_reserve_token_id: storage::get_usdc_reserve_token_id(&env),
+            target_ratio_bps: storage::get_target_ratio_bps(&env),
+            rebalance_band_bps: storage::get_rebalance_band_bps(&env),
+            min_total_usdc: storage::get_min_total_usdc(&env),
+            max_rebalance_amount: storage::get_max_rebalance_amount(&env),
+            min_rebalance_amount: storage::get_min_rebalance_amount(&env),
+            rebalance_cooldown_secs: storage::get_rebalance_cooldown_secs(&env),
+            principal_supplied: storage::get_principal_supplied(&env),
+            last_rebalance_ts: storage::get_last_rebalance_ts(&env),
+            last_harvest_ts: storage::get_last_harvest_ts(&env),
+            paused: storage::get_paused(&env),
+            version: storage::get_version(&env),
+        }
+    }
     pub fn payload(_env: Env, _event_id: BytesN<20>) -> Option<Bytes> {
         None
     }
