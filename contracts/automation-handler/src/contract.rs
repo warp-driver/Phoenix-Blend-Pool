@@ -4,6 +4,7 @@ use soroban_sdk::{
 use warpdrive_shared::interfaces::{
     handler::{Ed25519SignatureData, HandlerError, Verified, XlmEnvelope},
     verification::Ed25519VerificationClient,
+    warpdrive::{ContractUpgraded, WarpDriveInterface},
 };
 
 use crate::externals::{
@@ -47,6 +48,7 @@ impl AutomationHandler {
     #[allow(clippy::too_many_arguments)]
     pub fn __constructor(
         env: Env,
+        admin: Address,
         verification_contract: Address,
         blended_pool: Address,
         blend_pool: Address,
@@ -69,6 +71,7 @@ impl AutomationHandler {
         );
         assert!(min_total_usdc >= 0, "min_total_usdc must be non-negative");
 
+        storage::set_admin(&env, &admin);
         storage::set_verification_contract(&env, &verification_contract);
         storage::set_blended_pool(&env, &blended_pool);
         storage::set_blend_pool(&env, &blend_pool);
@@ -170,6 +173,44 @@ impl AutomationHandler {
 
     pub fn payload(_env: Env, _event_id: BytesN<20>) -> Option<Bytes> {
         None
+    }
+}
+
+/// Standard WarpDrive admin + upgrade + version surface. Matches the
+/// canonical pattern in `warpdrive-contracts/contracts/stellar-handler`
+/// so dashboards and admin tooling can drive every WarpDrive handler
+/// through one interface.
+#[contractimpl]
+impl WarpDriveInterface for AutomationHandler {
+    fn upgrade(env: Env, new_wasm_hash: BytesN<32>, new_version: String) {
+        let admin = storage::get_admin(&env);
+        admin.require_auth();
+
+        storage::set_version(&env, &new_version);
+        storage::extend_instance_ttl(&env);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        ContractUpgraded::new(new_version).publish(&env);
+    }
+
+    fn admin(env: Env) -> Address {
+        storage::get_admin(&env)
+    }
+
+    fn pending_admin(env: Env) -> Option<Address> {
+        warpdrive_shared::admin::pending(&env)
+    }
+
+    fn propose_admin(env: Env, new_admin: Address) {
+        warpdrive_shared::admin::propose(&env, &storage::get_admin(&env), new_admin);
+    }
+
+    fn accept_admin(env: Env) {
+        let new_admin = warpdrive_shared::admin::accept(&env);
+        storage::set_admin(&env, &new_admin);
+    }
+
+    fn version(env: Env) -> String {
+        storage::get_version(&env)
     }
 }
 

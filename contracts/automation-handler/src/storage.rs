@@ -3,6 +3,7 @@ use warpdrive_shared::ttl;
 
 #[contracttype]
 pub enum DataKey {
+    Admin,
     VerificationContract,
     BlendedPool,
     BlendPool,
@@ -32,6 +33,7 @@ macro_rules! address_accessors {
     };
 }
 
+address_accessors!(get_admin, set_admin, DataKey::Admin, "admin not set");
 address_accessors!(
     get_verification_contract,
     set_verification_contract,
@@ -162,6 +164,13 @@ pub fn get_principal_supplied(env: &Env) -> i128 {
 
 pub fn set_version(env: &Env, v: &String) {
     env.storage().instance().set(&DataKey::Version, v);
+}
+
+pub fn get_version(env: &Env) -> String {
+    env.storage()
+        .instance()
+        .get(&DataKey::Version)
+        .expect("version not set")
 }
 
 pub fn is_event_seen(env: &Env, event_id: &BytesN<20>) -> bool {

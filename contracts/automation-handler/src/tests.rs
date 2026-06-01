@@ -251,6 +251,7 @@ struct Harness<'a> {
     env: Env,
     handler: AutomationHandlerClient<'a>,
     handler_id: Address,
+    handler_admin: Address,
     mock_pool: MockBlendedPoolClient<'a>,
     mock_pool_id: Address,
     mock_blend: MockBlendPoolClient<'a>,
@@ -290,10 +291,12 @@ fn setup() -> Harness<'static> {
     let blnd_treasury = Address::generate(&env);
 
     let verification = Address::generate(&env);
+    let handler_admin = Address::generate(&env);
 
     let handler_id = env.register(
         AutomationHandler,
         (
+            handler_admin.clone(),
             verification.clone(),
             mock_pool_id.clone(),
             mock_blend_id.clone(),
@@ -318,6 +321,7 @@ fn setup() -> Harness<'static> {
         env,
         handler,
         handler_id,
+        handler_admin,
         mock_pool,
         mock_pool_id,
         mock_blend,
@@ -647,4 +651,43 @@ fn harvest_zero_principal_still_routes_blnd_to_treasury() {
     assert_eq!(h.blnd_token.balance(&h.blnd_treasury), blnd_emissions);
     assert!(h.mock_pool.last_donate().is_none());
     assert_eq!(h.handler.principal_supplied(), 0);
+}
+
+// --- Admin / WarpDriveInterface tests ---------------------------------------
+
+#[test]
+fn admin_is_stored_from_constructor() {
+    let h = setup();
+    assert_eq!(h.handler.admin(), h.handler_admin);
+    assert!(h.handler.pending_admin().is_none());
+}
+
+#[test]
+fn version_returns_pkg_version() {
+    let h = setup();
+    assert_eq!(
+        h.handler.version(),
+        soroban_sdk::String::from_str(&h.env, env!("CARGO_PKG_VERSION")),
+    );
+}
+
+#[test]
+fn admin_transfer_happy_path() {
+    let h = setup();
+    let new_admin = Address::generate(&h.env);
+
+    h.handler.propose_admin(&new_admin);
+    assert_eq!(h.handler.pending_admin(), Some(new_admin.clone()));
+    assert_eq!(h.handler.admin(), h.handler_admin);
+
+    h.handler.accept_admin();
+    assert_eq!(h.handler.admin(), new_admin);
+    assert!(h.handler.pending_admin().is_none());
+}
+
+#[test]
+#[should_panic]
+fn accept_admin_without_proposal_panics() {
+    let h = setup();
+    h.handler.accept_admin();
 }

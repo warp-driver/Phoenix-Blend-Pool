@@ -243,15 +243,19 @@ tasks:
   deploy-handler:
     desc: |
       Deploy automation-handler. Reads verification contract from
-      out/deploy.json; takes blended_pool/blend_pool/usdc/xlm/blnd_treasury and the
-      rebalance policy (target/band/min) from task vars (overrideable via
-      env). Writes out/handler.json.
+      out/deploy.json; takes blended_pool/blend_pool/usdc/xlm/blnd_treasury
+      and the rebalance policy (target/band/min/cooldown) from task vars
+      (overrideable via env). HANDLER_ADMIN defaults to DEPLOYER_ADDRESS;
+      override it to a different multisig / DAO key for production. Writes
+      out/handler.json.
     deps: [build-handler]
     cmds:
       - mkdir -p out
       - |
         set -euo pipefail
         : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
+        : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
+        ADMIN="${HANDLER_ADMIN:-$DEPLOYER_ADDRESS}"
         VERIFICATION=$(jq -r .contracts.ed25519_verification out/deploy.json)
         HANDLER_ADDR=$(stellar contract deploy \
             --wasm contracts/automation-handler/target/wasm32v1-none/release/automation_handler.wasm \
@@ -259,6 +263,7 @@ tasks:
             --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
             --source "$DEPLOYER_SECRET" \
             -- \
+            --admin "$ADMIN" \
             --verification_contract "$VERIFICATION" \
             --blended_pool "{{.BLENDED_POOL}}" \
             --blend_pool "{{.BLEND_POOL}}" \
