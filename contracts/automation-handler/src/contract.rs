@@ -7,7 +7,7 @@ use warpdrive_shared::interfaces::{
     warpdrive::{ContractUpgraded, WarpDriveInterface},
 };
 use crate::events::{
-    HarvestCompleted, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
+    ConfigUpdated, HarvestCompleted, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
 };
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
@@ -84,6 +84,10 @@ impl AutomationHandler {
         storage::set_target_ratio_bps(&env, target_ratio_bps);
         storage::set_rebalance_band_bps(&env, rebalance_band_bps);
         storage::set_min_total_usdc(&env, min_total_usdc);
+        // max/min rebalance scope limits default to 0 ("unlimited" / "no
+        // floor") and are tightened post-deploy by the admin via setters.
+        // The defaults preserve handler behaviour for legacy deploys that
+        // do not call the setters.
         storage::set_rebalance_cooldown_secs(&env, rebalance_cooldown_secs);
         storage::set_last_rebalance_ts(&env, 0);
         storage::set_principal_supplied(&env, 0);
@@ -157,6 +161,14 @@ impl AutomationHandler {
         storage::get_min_total_usdc(&env)
     }
 
+    pub fn max_rebalance_amount(env: Env) -> i128 {
+        storage::get_max_rebalance_amount(&env)
+    }
+
+    pub fn min_rebalance_amount(env: Env) -> i128 {
+        storage::get_min_rebalance_amount(&env)
+    }
+
     pub fn principal_supplied(env: Env) -> i128 {
         storage::get_principal_supplied(&env)
     }
@@ -175,6 +187,33 @@ impl AutomationHandler {
 
     pub fn payload(_env: Env, _event_id: BytesN<20>) -> Option<Bytes> {
         None
+    }
+
+    /// Admin-only: clamp the per-tx USDC amount moved between pool and Blend.
+    /// `0` is the "unlimited" sentinel. Emits a `ConfigUpdated` event so
+    /// dashboards can react.
+    pub fn set_max_rebalance_amount(env: Env, amount: i128) {
+        storage::get_admin(&env).require_auth();
+        assert!(amount >= 0, "max_rebalance_amount must be non-negative");
+        storage::set_max_rebalance_amount(&env, amount);
+        ConfigUpdated::new(
+            soroban_sdk::symbol_short!("max_reb"),
+            amount,
+        )
+        .publish(&env);
+    }
+
+    /// Admin-only: dust floor below which a Rebalance is a silent no-op
+    /// (does not consume the cooldown window). `0` means "no floor".
+    pub fn set_min_rebalance_amount(env: Env, amount: i128) {
+        storage::get_admin(&env).require_auth();
+        assert!(amount >= 0, "min_rebalance_amount must be non-negative");
+        storage::set_min_rebalance_amount(&env, amount);
+        ConfigUpdated::new(
+            soroban_sdk::symbol_short!("min_reb"),
+            amount,
+        )
+        .publish(&env);
     }
 }
 
@@ -289,12 +328,24 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
     let lower = target_liquid.saturating_sub(band);
 
     let delegated_before = total_usdc - liquid_usdc;
+    let max_cap = storage::get_max_rebalance_amount(env);
+    let min_floor = storage::get_min_rebalance_amount(env);
 
     if liquid_usdc > upper {
         // Pool is over-liquid in USDC - supply the excess to Blend.
-        let amount = liquid_usdc
+        let natural = liquid_usdc
             .checked_sub(target_liquid)
             .ok_or(HandlerError::OtherInvocationError)?;
+        // Dust floor: skip without consuming cooldown.
+        if natural < min_floor {
+            return Ok(());
+        }
+        // Cap clamp: 0 means unlimited.
+        let amount = if max_cap > 0 && natural > max_cap {
+            max_cap
+        } else {
+            natural
+        };
         pool_client.withdraw_to_delegate(&usdc, &amount);
         blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, amount);
         let prev = storage::get_principal_supplied(env);
@@ -313,17 +364,23 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         .publish(env);
     } else if liquid_usdc < lower {
         // Pool is under-liquid in USDC - pull from Blend to top up.
-        let mut amount = target_liquid
+        let natural = target_liquid
             .checked_sub(liquid_usdc)
             .ok_or(HandlerError::OtherInvocationError)?;
-        // Cap at what we have parked. If the pool's `delegated_a/b` somehow
-        // exceeds what's actually redeemable from Blend (e.g. bad-debt
-        // write-down), the Blend call would revert and we'd be stuck. Use
-        // the locally tracked principal as a sanity cap.
         let principal = storage::get_principal_supplied(env);
-        if amount > principal {
-            amount = principal;
+        // Sanity cap at locally tracked principal (Blend would revert if a
+        // bad-debt write-down made the position smaller than expected).
+        let bounded = natural.min(principal);
+        // Dust floor: skip without consuming cooldown.
+        if bounded < min_floor {
+            return Ok(());
         }
+        // Cap clamp: 0 means unlimited.
+        let amount = if max_cap > 0 && bounded > max_cap {
+            max_cap
+        } else {
+            bounded
+        };
         if amount > 0 {
             blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, amount);
             pool_client.deposit_from_delegate(&usdc, &amount);

@@ -2,6 +2,7 @@
 extern crate alloc;
 
 mod contract;
+mod error;
 mod events;
 mod externals;
 mod storage;

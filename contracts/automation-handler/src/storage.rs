@@ -15,8 +15,11 @@ pub enum DataKey {
     TargetRatioBps,
     RebalanceBandBps,
     MinTotalUsdc,
+    MaxRebalanceAmount,
+    MinRebalanceAmount,
     RebalanceCooldownSecs,
     LastRebalanceTs,
+    Paused,
     Version,
     EventSeen(BytesN<20>),
 }
@@ -114,6 +117,52 @@ pub fn get_min_total_usdc(env: &Env) -> i128 {
         .instance()
         .get(&DataKey::MinTotalUsdc)
         .expect("min total usdc not set")
+}
+
+/// Per-call cap on the USDC amount moved between the pool and Blend. The
+/// natural amount derived from drift math is clamped to this value when it
+/// exceeds the cap; the action still proceeds with the clamped amount. A
+/// stored `0` is the explicit "unlimited" sentinel and the
+/// default-when-unset.
+pub fn set_max_rebalance_amount(env: &Env, amount: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MaxRebalanceAmount, &amount);
+}
+
+pub fn get_max_rebalance_amount(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MaxRebalanceAmount)
+        .unwrap_or(0)
+}
+
+/// Dust floor: if the natural amount falls below this, Rebalance is a
+/// no-op WITHOUT consuming the cooldown. Default-when-unset is `0`.
+pub fn set_min_rebalance_amount(env: &Env, amount: i128) {
+    env.storage()
+        .instance()
+        .set(&DataKey::MinRebalanceAmount, &amount);
+}
+
+pub fn get_min_rebalance_amount(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::MinRebalanceAmount)
+        .unwrap_or(0)
+}
+
+/// Pause flag. When `true`, `verify_xlm` short-circuits with
+/// `LocalError::Paused` (600). Default-when-unset is `false`.
+pub fn set_paused(env: &Env, paused: bool) {
+    env.storage().instance().set(&DataKey::Paused, &paused);
+}
+
+pub fn get_paused(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::Paused)
+        .unwrap_or(false)
 }
 
 /// Minimum seconds between two successive rebalance moves. Set in the

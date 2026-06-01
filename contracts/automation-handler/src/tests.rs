@@ -27,6 +27,8 @@ use crate::externals::{
 const TARGET_BPS: u32 = 5_000; // 50%
 const BAND_BPS: u32 = 500; // +/- 5%
 const MIN_TOTAL_USDC: i128 = 1_000_000_000; // 100 USDC at 7 decimals
+const MAX_REBALANCE_AMOUNT: i128 = 0; // unlimited (0 sentinel)
+const MIN_REBALANCE_AMOUNT: i128 = 0; // no dust floor
 const COOLDOWN_SECS: u64 = 60;
 const USDC_RESERVE_TOKEN_ID: u32 = 1;
 const INITIAL_TS: u64 = 1_000_000;
@@ -741,4 +743,111 @@ fn harvest_emits_harvest_completed_event() {
         !from_handler.events().is_empty(),
         "handler must emit HarvestCompleted on every harvest tick",
     );
+}
+
+// --- Scope-limit tests -------------------------------------------------------
+
+#[test]
+fn max_rebalance_amount_defaults_to_zero_unlimited() {
+    let h = setup();
+    assert_eq!(h.handler.max_rebalance_amount(), 0);
+}
+
+#[test]
+fn min_rebalance_amount_defaults_to_zero_no_floor() {
+    let h = setup();
+    assert_eq!(h.handler.min_rebalance_amount(), 0);
+}
+
+#[test]
+fn admin_can_tighten_max_rebalance_amount() {
+    let h = setup();
+    let cap: i128 = 50_000_000_000;
+    h.handler.set_max_rebalance_amount(&cap);
+    assert_eq!(h.handler.max_rebalance_amount(), cap);
+}
+
+#[test]
+fn admin_can_tighten_min_rebalance_amount() {
+    let h = setup();
+    let floor: i128 = 1_000_000_000;
+    h.handler.set_min_rebalance_amount(&floor);
+    assert_eq!(h.handler.min_rebalance_amount(), floor);
+}
+
+#[test]
+fn rebalance_to_blend_clamps_at_max_cap() {
+    let h = setup();
+    // Without cap, this would move 200 USDC excess; cap it at 80.
+    let cap: i128 = 80_000_000_000;
+    h.handler.set_max_rebalance_amount(&cap);
+
+    let liquid: i128 = 700_000_000_000;
+    let delegated: i128 = 300_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.usdc_admin.mint(&h.mock_pool_id, &liquid);
+
+    h.handler.test_rebalance();
+
+    let sup = h.mock_blend.last_submit_supply().expect("Blend Supply not called");
+    assert_eq!(sup, (h.usdc.clone(), cap), "supply amount must be clamped");
+    assert_eq!(h.handler.principal_supplied(), cap);
+    assert_eq!(h.handler.last_rebalance_ts(), INITIAL_TS);
+}
+
+#[test]
+fn rebalance_from_blend_clamps_at_max_cap() {
+    let h = setup();
+    let cap: i128 = 50_000_000_000;
+    h.handler.set_max_rebalance_amount(&cap);
+
+    let liquid: i128 = 300_000_000_000;
+    let delegated: i128 = 700_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.handler.test_set_principal_supplied(&delegated);
+    seed_blend_supply(&h, delegated);
+    // seed_blend_supply re-sets principal; restore the principal we want.
+    h.handler.test_set_principal_supplied(&delegated);
+
+    h.handler.test_rebalance();
+
+    let wd = h.mock_blend.last_submit_withdraw().expect("Withdraw not called");
+    assert_eq!(wd, (h.usdc.clone(), cap), "withdraw amount must be clamped");
+    assert_eq!(h.handler.principal_supplied(), delegated - cap);
+}
+
+#[test]
+fn rebalance_below_min_floor_is_no_op() {
+    let h = setup();
+    // Natural top-up amount = 200; set floor to 250 → no-op (no cooldown either).
+    h.handler.set_min_rebalance_amount(&250_000_000_000);
+
+    let liquid: i128 = 300_000_000_000;
+    let delegated: i128 = 700_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.handler.test_set_principal_supplied(&delegated);
+
+    h.handler.test_rebalance();
+
+    assert!(h.mock_pool.last_deposit().is_none());
+    assert!(h.mock_blend.last_submit_withdraw().is_none());
+    assert_eq!(h.handler.last_rebalance_ts(), 0, "no-op must not consume cooldown");
+}
+
+#[test]
+#[should_panic]
+fn non_admin_cannot_set_max_rebalance_amount() {
+    let h = setup();
+    // The set_max_rebalance_amount entrypoint requires admin auth; with
+    // `mock_all_auths_allowing_non_root_auth` the call would otherwise pass.
+    // We re-enable strict auth temporarily and assert the call panics.
+    h.env.set_auths(&[]);
+    h.handler.set_max_rebalance_amount(&1);
+}
+
+#[test]
+#[should_panic(expected = "max_rebalance_amount must be non-negative")]
+fn negative_max_rebalance_amount_rejected() {
+    let h = setup();
+    h.handler.set_max_rebalance_amount(&-1);
 }
