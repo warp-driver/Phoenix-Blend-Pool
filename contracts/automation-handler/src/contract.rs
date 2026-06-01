@@ -302,6 +302,99 @@ impl AutomationHandler {
         EmergencyUnwound::new(redeemed, principal_before).publish(&env);
     }
 
+    /// Admin-only: push `amount` USDC from the blended pool to Blend out
+    /// of band. Useful for the initial seeding right after deploy (when
+    /// no swap events have fired) and for manual top-ups during operator
+    /// downtime.
+    ///
+    /// Bypasses cooldown, band, min-total, and scope-limit gates because
+    /// the admin already exercised judgement. Still honours pause and the
+    /// Blend-health gate (a Supply into a Frozen pool would revert anyway).
+    pub fn manual_to_blend(env: Env, amount: i128) {
+        storage::get_admin(&env).require_auth();
+        assert!(amount > 0, "amount must be positive");
+        if storage::get_paused(&env) {
+            soroban_sdk::panic_with_error!(&env, crate::error::LocalError::Paused);
+        }
+
+        let blended_pool = storage::get_blended_pool(&env);
+        let blend_pool = storage::get_blend_pool(&env);
+        let usdc = storage::get_usdc(&env);
+        let xlm = storage::get_xlm(&env);
+        assert!(
+            BlendPoolClient::new(&env, &blend_pool).get_config().status <= BLEND_HEALTHY_STATUS_MAX,
+            "Blend pool is not healthy (status > 3); cannot Supply",
+        );
+
+        let pool_client = BlendedPoolClient::new(&env, &blended_pool);
+        pool_client.withdraw_to_delegate(&usdc, &amount);
+        blend_submit(&env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, amount);
+
+        let prev = storage::get_principal_supplied(&env);
+        let principal_after = prev.checked_add(amount).expect("principal overflow");
+        storage::set_principal_supplied(&env, principal_after);
+
+        let state = pool_client.query_delegate_state();
+        let (liquid_after, delegated_after) = if usdc < xlm {
+            (state.liquid_a, state.delegated_a)
+        } else {
+            (state.liquid_b, state.delegated_b)
+        };
+        RebalanceExecuted::new(
+            DIRECTION_TO_BLEND,
+            amount,
+            liquid_after,
+            delegated_after,
+            principal_after,
+        )
+        .publish(&env);
+    }
+
+    /// Admin-only: pull `amount` USDC from Blend back to the blended pool
+    /// out of band. The dual of `manual_to_blend`. `emergency_unwind` is
+    /// the right tool for a full drain; this exists for partial unwinds
+    /// where the admin wants tactical control over the amount.
+    pub fn manual_from_blend(env: Env, amount: i128) {
+        storage::get_admin(&env).require_auth();
+        assert!(amount > 0, "amount must be positive");
+        if storage::get_paused(&env) {
+            soroban_sdk::panic_with_error!(&env, crate::error::LocalError::Paused);
+        }
+
+        let principal_before = storage::get_principal_supplied(&env);
+        assert!(
+            amount <= principal_before,
+            "amount exceeds principal_supplied; use emergency_unwind for full drain",
+        );
+
+        let blended_pool = storage::get_blended_pool(&env);
+        let blend_pool = storage::get_blend_pool(&env);
+        let usdc = storage::get_usdc(&env);
+        let xlm = storage::get_xlm(&env);
+
+        blend_submit(&env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, amount);
+        let pool_client = BlendedPoolClient::new(&env, &blended_pool);
+        pool_client.deposit_from_delegate(&usdc, &amount);
+
+        let principal_after = (principal_before - amount).max(0);
+        storage::set_principal_supplied(&env, principal_after);
+
+        let state = pool_client.query_delegate_state();
+        let (liquid_after, delegated_after) = if usdc < xlm {
+            (state.liquid_a, state.delegated_a)
+        } else {
+            (state.liquid_b, state.delegated_b)
+        };
+        RebalanceExecuted::new(
+            DIRECTION_FROM_BLEND,
+            amount,
+            liquid_after,
+            delegated_after,
+            principal_after,
+        )
+        .publish(&env);
+    }
+
     /// Admin-only: tighten or relax the target liquid-USDC share of total
     /// USDC. Same range validation as the constructor (strictly within
     /// (0, 10000) bps).

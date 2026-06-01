@@ -1204,3 +1204,91 @@ fn updated_target_changes_band_check_behaviour() {
     assert_eq!(wd.0, h.usdc);
     assert!(wd.1 > 0);
 }
+
+// --- Manual admin entrypoints ------------------------------------------------
+
+#[test]
+fn manual_to_blend_seeds_principal() {
+    let h = setup();
+    let seed: i128 = 50_000_000_000;
+    set_usdc_state(&h, 500_000_000_000, 500_000_000_000);
+    h.usdc_admin.mint(&h.mock_pool_id, &seed);
+
+    h.handler.manual_to_blend(&seed);
+
+    let sup = h.mock_blend.last_submit_supply().expect("Supply not called");
+    assert_eq!(sup, (h.usdc.clone(), seed));
+    let wd = h.mock_pool.last_withdraw().expect("withdraw_to_delegate not called");
+    assert_eq!(wd, (h.usdc.clone(), seed));
+    assert_eq!(h.handler.principal_supplied(), seed);
+}
+
+#[test]
+fn manual_to_blend_ignores_cooldown_and_band() {
+    // Within-band state would no-op the normal rebalance path, but
+    // manual_to_blend is unconditional.
+    let h = setup();
+    let seed: i128 = 10_000_000_000;
+    set_usdc_state(&h, 520_000_000_000, 480_000_000_000);
+    h.usdc_admin.mint(&h.mock_pool_id, &seed);
+    h.handler.test_set_last_rebalance_ts(&(INITIAL_TS + 10_000));
+
+    h.handler.manual_to_blend(&seed);
+
+    assert_eq!(h.handler.principal_supplied(), seed);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #600)")]
+fn manual_to_blend_panics_when_paused() {
+    let h = setup();
+    set_usdc_state(&h, 500_000_000_000, 500_000_000_000);
+    h.usdc_admin.mint(&h.mock_pool_id, &10_i128);
+    h.handler.pause();
+    h.handler.manual_to_blend(&10);
+}
+
+#[test]
+#[should_panic(expected = "Blend pool is not healthy")]
+fn manual_to_blend_panics_when_blend_frozen() {
+    let h = setup();
+    set_usdc_state(&h, 500_000_000_000, 500_000_000_000);
+    h.mock_blend.set_status(&5);
+    h.handler.manual_to_blend(&10_000_000_000);
+}
+
+#[test]
+#[should_panic(expected = "amount must be positive")]
+fn manual_to_blend_rejects_zero() {
+    let h = setup();
+    h.handler.manual_to_blend(&0);
+}
+
+#[test]
+fn manual_from_blend_partial_drain() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    let partial: i128 = 30_000_000_000;
+    seed_blend_supply(&h, principal);
+    // pool state must reflect the delegated_out from a prior withdraw_to_delegate;
+    // for this test the pool mock just transfers tokens and updates last_deposit.
+    set_usdc_state(&h, 400_000_000_000, principal);
+
+    h.handler.manual_from_blend(&partial);
+
+    let wd = h.mock_blend.last_submit_withdraw().expect("Withdraw not called");
+    assert_eq!(wd, (h.usdc.clone(), partial));
+    let dp = h.mock_pool.last_deposit().expect("deposit_from_delegate not called");
+    assert_eq!(dp, (h.usdc.clone(), partial));
+    assert_eq!(h.handler.principal_supplied(), principal - partial);
+}
+
+#[test]
+#[should_panic(expected = "amount exceeds principal_supplied")]
+fn manual_from_blend_rejects_overdraw() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    seed_blend_supply(&h, principal);
+    set_usdc_state(&h, 400_000_000_000, principal);
+    h.handler.manual_from_blend(&(principal + 1));
+}
