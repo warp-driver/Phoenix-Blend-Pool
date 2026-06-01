@@ -361,6 +361,7 @@ impl AutomationHandler {
 
         storage::set_principal_supplied(&env, 0);
         EmergencyUnwound::new(redeemed, principal_before).publish(&env);
+        assert_no_usdc_residue(&env);
     }
 
     /// Admin-only: push `amount` USDC from the blended pool to Blend out
@@ -409,6 +410,7 @@ impl AutomationHandler {
             principal_after,
         )
         .publish(&env);
+        assert_no_usdc_residue(&env);
     }
 
     /// Admin-only: pull `amount` USDC from Blend back to the blended pool
@@ -454,6 +456,7 @@ impl AutomationHandler {
             principal_after,
         )
         .publish(&env);
+        assert_no_usdc_residue(&env);
     }
 
     /// Admin-only: tighten or relax the target liquid-USDC share of total
@@ -714,6 +717,7 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         }
     }
     // Inside the band: no-op.
+    assert_no_usdc_residue(env);
     Ok(())
 }
 
@@ -783,9 +787,24 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
     storage::set_last_harvest_ts(env, env.ledger().timestamp());
     HarvestCompleted::new(interest_donated, blnd_routed, principal_after).publish(env);
 
+    assert_no_usdc_residue(env);
     Ok(())
 }
 
+
+/// Post-action invariant: the handler must NOT hold any USDC. Any
+/// non-zero residue means an entrypoint forgot to push tokens out before
+/// returning, which would silently leak funds across calls. Reverts the
+/// transaction with `LocalError::UsdcLeak` (601) so the action is rolled
+/// back. Called at the end of every money-moving entrypoint and executor.
+fn assert_no_usdc_residue(env: &Env) {
+    let usdc = storage::get_usdc(env);
+    let bal = soroban_sdk::token::Client::new(env, &usdc)
+        .balance(&env.current_contract_address());
+    if bal != 0 {
+        soroban_sdk::panic_with_error!(env, crate::error::LocalError::UsdcLeak);
+    }
+}
 
 fn blend_submit(
     env: &Env,

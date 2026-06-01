@@ -18,4 +18,9 @@ pub enum LocalError {
     /// `verify_xlm` invoked while the handler is paused. Operators should
     /// not retry until the dashboard shows `paused = false`.
     Paused = 600,
+
+    /// Post-condition violation: the handler still holds USDC after an
+    /// action completed. Indicates a code bug that would otherwise leak
+    /// funds; reverts the tx so the previous-state invariant is preserved.
+    UsdcLeak = 601,
 }

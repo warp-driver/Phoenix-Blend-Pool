@@ -1366,3 +1366,40 @@ fn query_state_reflects_runtime_changes() {
     assert_eq!(s.principal_supplied, 77_000_000_000);
     assert_eq!(s.pending_admin, Some(new_admin));
 }
+
+// --- USDC-leak post-condition guard -----------------------------------------
+
+#[test]
+#[should_panic(expected = "Error(Contract, #601)")]
+fn usdc_leak_guard_trips_on_residue() {
+    // Drop USDC directly into the handler before invoking a money-moving
+    // entrypoint. The action runs cleanly through but the post-call
+    // invariant catches the unexplained balance and reverts with
+    // LocalError::UsdcLeak (601).
+    let h = setup();
+    let principal: i128 = 50_000_000_000;
+    seed_blend_supply(&h, principal);
+    // Plant residue: simulate a buggy path that leaves USDC on the handler.
+    h.usdc_admin.mint(&h.handler_id, &1_000_000_000);
+
+    h.handler.test_harvest();
+}
+
+#[test]
+fn happy_path_leaves_no_residue() {
+    // The standard ToBlend rebalance must not leak USDC.
+    let h = setup();
+    let liquid: i128 = 700_000_000_000;
+    let delegated: i128 = 300_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.usdc_admin.mint(&h.mock_pool_id, &liquid);
+
+    h.handler.test_rebalance();
+
+    let usdc_token = soroban_sdk::token::Client::new(&h.env, &h.usdc);
+    assert_eq!(
+        usdc_token.balance(&h.handler_id),
+        0,
+        "handler must hold no USDC after a clean rebalance",
+    );
+}
