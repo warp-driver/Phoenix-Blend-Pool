@@ -502,22 +502,128 @@ the configured target ratio after each rebalance fires.
 
 ---
 
-## Phased rollout (recommended)
+## Phased rollout
 
-Per `PHOENIX_BLEND_AUTOMATION.md`:
+Per `PHOENIX_BLEND_AUTOMATION.md`. Each phase has explicit gating
+criteria; do NOT advance until the current phase's success conditions
+are met for at least the listed minimum window. Roll back to the
+previous phase on any unresolved failure of a gating criterion.
 
-1. **Testnet shadow.** Deploy full stack against testnet Phoenix + testnet
-   Blend (or mocked Blend). Run 1-2 weeks with synthetic swap traffic.
-   Verify cooldown gating, harvest yield correctness, drift convergence,
-   and Blend bad-debt recovery (simulate by adjusting `set_redeemable`-
-   equivalent on a test Blend deploy).
-2. **Mainnet dry-run.** Deploy contracts to mainnet but with a small TVL
-   cap (e.g. `min_total_usdc` set to a value above the actual pool TVL so
-   automation is a no-op). Run for 48-72 hours with opt-in beta LPs.
-3. **Mainnet launch.** Phoenix flips routing to the new pool. Lower
-   `min_total_usdc` to its real-deployment value, migrate incentives.
+### Phase A: Testnet shadow (1-2 weeks)
+
+**Goal.** Prove the full stack works against a real (or mocked) Blend
+with synthetic traffic before any mainnet value is at risk.
+
+Setup:
+
+- Deploy `phoenix-pool-blended` on Stellar testnet with admin = Phoenix
+  deploy key. Seed liquidity with the deploy account.
+- Deploy or mock a Blend USDC pool on testnet. If using a real testnet
+  Blend, confirm it accepts Supply / Withdraw via `submit`.
+- Deploy `automation-handler` with conservative defaults:
+  `target=50%`, `band=10%`, `min_total=10_000 USDC`, `cooldown=15min`,
+  `max_rebalance_amount=` "1-2% of pool TVL", `min_rebalance_amount=` a
+  meaningful dust floor.
+- Wire delegate (`task set-delegate`).
+- 3 operators minimum, threshold 2-of-3.
+- Seed via `manual_to_blend(target_share_of_pool_usdc)`.
+
+Drive traffic:
+
+- Synthetic swap script generating 50-200 swaps/day on the blended pool
+  with realistic size distribution.
+- Synthetic LP add/remove churn 5-10x/day.
+- Manually trigger Blend bad-debt scenarios via the testnet Blend admin
+  tools (or by adjusting the mock's redeemable value).
+
+Gating criteria — ALL must hold for 7 consecutive days:
+
+| Criterion | How to check |
+| --------- | ------------ |
+| Rebalance fires inside cooldown + band | `last_rebalance_ts` matches event-trigger time within seconds; `liquid / total` returns inside band after every action. |
+| Harvest fires on cron schedule | Count `HarvestCompleted` events; should be exactly `(86400 / harvest_interval_secs)` per day. |
+| Interest is actually donated | `interest_donated > 0` on every harvest with positive yield. Total LP claim on USDC grows monotonically. |
+| BLND routes straight to treasury | Treasury BLND balance grows; handler BLND balance stays 0. |
+| Bad-debt path doesn't brick the handler | After a forced write-down, `principal_supplied` shrinks; subsequent harvests + rebalances continue. |
+| Pause works | Admin pauses; verify next quorum-signed envelope panics with code 600. Unpause resumes. |
+| Emergency unwind works | Admin calls `emergency_unwind`; `principal_supplied` returns to 0; pool reabsorbs USDC. |
+| Blend Frozen handled | Force Blend status > 3 (testnet admin); confirm Rebalance no-ops, Harvest claims BLND only. |
+
+On failure: fix the bug in this repo, re-deploy, restart the 7-day clock.
+
+### Phase B: Mainnet dry-run (48-72 hours)
+
+**Goal.** Validate against real production contracts and real Blend
+state, with no actual automation movement.
+
+Setup:
+
+- All production addresses populated per the
+  "Resolving production addresses" section above.
+- Deploy `automation-handler` on mainnet against the real `BLENDED_POOL`
+  and `BLEND_POOL`.
+- Quorum is the production size (4-of-5 or 5-of-7 — see
+  `ARCHITECTURE.md` Q7 for the chosen threshold).
+- `min_total_usdc` set ABOVE the current actual pool USDC TVL so every
+  rebalance attempt is a no-op. The handler is "armed but dormant".
+- Wire delegate (`task set-delegate`).
+- DO NOT seed (`manual_to_blend` deliberately skipped — principal stays
+  zero, no money in Blend yet).
+
+Drive traffic:
+
+- Real swap traffic from Phoenix's normal user base. Opt-in beta LPs may
+  be encouraged but not required.
+
+Gating criteria — ALL must hold for 48 hours:
+
+| Criterion | How to check |
+| --------- | ------------ |
+| Quorum-signed envelopes arrive on every swap | Aggregator logs show `signatures_collected=N/N` where N is threshold. |
+| `verify_xlm` returns `Ok` consistently | No `OtherInvocationError` / `Paused` errors on the handler tx logs. |
+| Rebalance no-op behaviour holds | `last_rebalance_ts` stays 0; no `RebalanceExecuted` events. |
+| Harvest cron fires on schedule | `HarvestCompleted` event per scheduled tick, all with `principal_after == 0`, `interest_donated == 0`. |
+| Operator network is healthy | All operators reachable on libp2p; `peers >= threshold - 1`. |
+
+On failure: pause via `pause()`, debug, unpause when fixed. If a
+contract-level bug is found, return to Phase A.
+
+### Phase C: Mainnet launch (gradual ramp)
+
+**Goal.** Switch automation on, ramped slowly enough that a problem can
+be paused before doing damage.
+
+Cutover sequence, executed by the admin multisig in one session:
+
+1. Confirm Phase B gating criteria still hold.
+2. `set_min_total_usdc(<real-floor>)`. From this moment on, Rebalance is
+   armed.
+3. `manual_to_blend(seed_amount)` where `seed_amount` is the smaller of:
+   - the real target liquid share of pool TVL (e.g. 5% on day one);
+   - `max_rebalance_amount` (already configured).
+   This sets the principal counter without going through quorum.
+4. Phoenix migrates LP incentives to the blended pool. LPs migrate.
+5. Monitor the dashboard for 72 hours minimum:
+   - `principal_supplied` and `liquid / total` track the target ±band.
+   - `interest_donated` accumulates per harvest.
+   - No `Paused` events.
+   - No `EmergencyUnwound` events.
+6. Once stable, increase `max_rebalance_amount` to a value that allows
+   converging to target in one or two rebalances after a large swap, and
+   call `manual_to_blend` to bring principal up to the steady-state
+   target.
+
+Roll-back:
+
+- Soft: `pause()` halts off-chain dispatch immediately. The pool stays
+  in its current liquid/delegated split.
+- Medium: `emergency_unwind()` drains Blend back to the pool. Position
+  is closed; LPs are not affected.
+- Hard: pool admin calls `pool_blended.set_delegate(None)`. The handler
+  can no longer touch the pool even if unpaused.
 
 ---
+
 
 ## Operational guidance
 
