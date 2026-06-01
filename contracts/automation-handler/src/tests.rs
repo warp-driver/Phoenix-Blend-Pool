@@ -21,7 +21,8 @@ use soroban_sdk::{
 
 use crate::contract::{AutomationHandler, AutomationHandlerClient};
 use crate::externals::{
-    BlendPositions, BlendRequest, DelegateState, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
+    BlendPoolConfig, BlendPositions, BlendRequest, DelegateState, BLEND_REQUEST_SUPPLY,
+    BLEND_REQUEST_WITHDRAW,
 };
 
 const TARGET_BPS: u32 = 5_000; // 50%
@@ -45,6 +46,7 @@ const KEY_DONATE: Symbol = symbol_short!("DONATE");
 const KEY_CLAIM_AMT: Symbol = symbol_short!("CLAIMAMT");
 const KEY_REDEEM: Symbol = symbol_short!("REDEEM");
 const KEY_SUPPLIED: Symbol = symbol_short!("SUPPLIED");
+const KEY_STATUS: Symbol = symbol_short!("STATUS");
 const KEY_SUP_CALL: Symbol = symbol_short!("SUPCALL");
 const KEY_WD_CALL: Symbol = symbol_short!("WDCALL");
 
@@ -244,6 +246,23 @@ impl MockBlendPool {
             env.storage().instance().set(&KEY_CLAIM_AMT, &0i128);
         }
         amount
+    }
+
+    /// Set the simulated Blend pool status. Defaults to 1 (Active) on
+    /// construction; tests override to exercise the handler's health gate.
+    pub fn set_status(env: Env, status: u32) {
+        env.storage().instance().set(&KEY_STATUS, &status);
+    }
+
+    pub fn get_config(env: Env) -> BlendPoolConfig {
+        let status: u32 = env.storage().instance().get(&KEY_STATUS).unwrap_or(1);
+        BlendPoolConfig {
+            bstop_rate: 0,
+            max_positions: 4,
+            min_collateral: 0,
+            oracle: env.current_contract_address(),
+            status,
+        }
     }
 }
 
@@ -1001,4 +1020,83 @@ fn emergency_unwind_bypasses_cooldown() {
     h.handler.emergency_unwind();
 
     assert_eq!(h.handler.principal_supplied(), 0);
+}
+
+// --- Blend health pre-check tests --------------------------------------------
+
+#[test]
+fn rebalance_skipped_when_blend_frozen() {
+    let h = setup();
+    h.mock_blend.set_status(&5); // Frozen
+
+    let liquid: i128 = 700_000_000_000;
+    let delegated: i128 = 300_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.usdc_admin.mint(&h.mock_pool_id, &liquid);
+
+    h.handler.test_rebalance();
+
+    assert!(h.mock_blend.last_submit_supply().is_none());
+    assert!(h.mock_pool.last_withdraw().is_none());
+    assert_eq!(h.handler.principal_supplied(), 0);
+    assert_eq!(h.handler.last_rebalance_ts(), 0, "no-op must not consume cooldown");
+}
+
+#[test]
+fn rebalance_skipped_when_blend_setup() {
+    let h = setup();
+    h.mock_blend.set_status(&6); // Setup
+
+    let liquid: i128 = 700_000_000_000;
+    let delegated: i128 = 300_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.usdc_admin.mint(&h.mock_pool_id, &liquid);
+
+    h.handler.test_rebalance();
+
+    assert!(h.mock_blend.last_submit_supply().is_none());
+    assert_eq!(h.handler.principal_supplied(), 0);
+}
+
+#[test]
+fn rebalance_proceeds_at_on_ice_status() {
+    // status 3 (OnIce) is below the threshold; Supply/Withdraw still allowed
+    // by Blend's `require_action_allowed` rule.
+    let h = setup();
+    h.mock_blend.set_status(&3);
+
+    let liquid: i128 = 700_000_000_000;
+    let delegated: i128 = 300_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    h.usdc_admin.mint(&h.mock_pool_id, &liquid);
+
+    h.handler.test_rebalance();
+
+    let expected = 200_000_000_000_i128;
+    let sup = h.mock_blend.last_submit_supply().expect("Supply must run at status 3");
+    assert_eq!(sup, (h.usdc.clone(), expected));
+}
+
+#[test]
+fn harvest_skips_withdraw_resupply_when_blend_frozen() {
+    let h = setup();
+    let principal: i128 = 100_000_000_000;
+    let blnd_emissions: i128 = 50_000_000_000;
+    seed_blend_supply(&h, principal);
+    h.blnd_admin.mint(&h.mock_blend_id, &blnd_emissions);
+    h.mock_blend.set_claim_amount(&blnd_emissions);
+    h.mock_blend.set_status(&5); // Frozen
+
+    h.handler.test_harvest();
+
+    // BLND emissions still routed to treasury.
+    assert_eq!(h.blnd_token.balance(&h.blnd_treasury), blnd_emissions);
+    // No withdraw / re-supply attempted.
+    assert!(h.mock_blend.last_submit_withdraw().is_none());
+    assert!(h.mock_pool.last_donate().is_none());
+    assert_eq!(
+        h.handler.principal_supplied(),
+        principal,
+        "principal_supplied unchanged when Blend leg is skipped",
+    );
 }

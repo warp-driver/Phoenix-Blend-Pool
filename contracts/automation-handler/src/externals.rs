@@ -57,6 +57,26 @@ pub struct BlendPositions {
 pub const BLEND_REQUEST_SUPPLY: u32 = 0;
 pub const BLEND_REQUEST_WITHDRAW: u32 = 1;
 
+/// Mirror of Blend's `PoolConfig` struct (see
+/// `blend-contracts-v2/pool/src/storage.rs::PoolConfig`). We only consume
+/// `status` for the health pre-check; the other fields ride along to keep
+/// the contracttype wire shape compatible.
+///
+/// `status` semantics (from `blend-contracts-v2/pool/src/pool/status.rs`):
+///   - 0 / 1: Active / Admin-Active — supply, withdraw, claim all allowed.
+///   - 2 / 3: Admin-OnIce / OnIce — withdraw + claim allowed; new supply blocked.
+///   - 4 / 5: Admin-Frozen / Frozen — all standard ops restricted.
+///   - 6:     Setup — not yet operational.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlendPoolConfig {
+    pub bstop_rate: u32,
+    pub max_positions: u32,
+    pub min_collateral: i128,
+    pub oracle: Address,
+    pub status: u32,
+}
+
 #[contractclient(name = "BlendPoolClient")]
 pub trait BlendPool {
     fn submit(
@@ -71,4 +91,8 @@ pub trait BlendPool {
     /// pairs to claim for; each id = reserve_index * 2 + (0 for d-tokens, 1 for b-tokens).
     /// Returns the total BLND transferred to `to`.
     fn claim(env: Env, from: Address, reserve_token_ids: Vec<u32>, to: Address) -> i128;
+
+    /// Read the pool's runtime config; the handler reads `status` to decide
+    /// whether the Blend leg is currently usable.
+    fn get_config(env: Env) -> BlendPoolConfig;
 }

@@ -18,6 +18,15 @@ use crate::storage;
 /// Basis-point denominator. `bps_value / BPS_DEN == ratio`.
 const BPS_DEN: i128 = 10_000;
 
+/// Highest Blend pool `status` value at which the handler's standard
+/// Supply / Withdraw calls are still expected to succeed. Statuses 0-3
+/// (Active / Admin-Active / Admin-OnIce / OnIce) allow withdraw and
+/// emissions claim; statuses 4-6 (Admin-Frozen / Frozen / Setup) put the
+/// pool into a state the handler treats as "do not touch" — Rebalance
+/// becomes a no-op and Harvest skips the withdraw/resupply leg. Admin can
+/// always call `emergency_unwind` to drain a Frozen position explicitly.
+const BLEND_HEALTHY_STATUS_MAX: u32 = 3;
+
 /// Payload encoded inside the XlmEnvelope by the off-chain circuit + quorum.
 ///
 /// Two variants:
@@ -370,6 +379,15 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
     let usdc = storage::get_usdc(env);
     let xlm = storage::get_xlm(env);
 
+    // Blend health pre-check. If the Blend pool is Admin-Frozen / Frozen /
+    // Setup (status > 3), Supply/Withdraw via `submit` would revert. Rather
+    // than burn gas reverting, bail early as a silent no-op (no cooldown
+    // consumed). The admin can call `emergency_unwind` explicitly to drain
+    // a Frozen position.
+    if BlendPoolClient::new(env, &blend_pool).get_config().status > BLEND_HEALTHY_STATUS_MAX {
+        return Ok(());
+    }
+
     let pool_client = BlendedPoolClient::new(env, &blended_pool);
     let state = pool_client.query_delegate_state();
     let (liquid_usdc, total_usdc) = if usdc < xlm {
@@ -511,10 +529,14 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
     ids.push_back(usdc_reserve_token_id);
     let blnd_routed = blend.claim(&env.current_contract_address(), &ids, &blnd_treasury);
 
-    // 2 + 3. Peel off USDC interest, then donate it.
+    // 2 + 3. Peel off USDC interest, then donate it. Only attempt the
+    // withdraw/resupply cycle when Blend is healthy enough (`status <= 3`);
+    // otherwise the Supply leg would revert. BLND emissions claim above
+    // does not require pool health and runs unconditionally.
     let mut interest_donated: i128 = 0;
     let mut principal_after = principal;
-    if principal > 0 {
+    let blend_healthy = blend.get_config().status <= BLEND_HEALTHY_STATUS_MAX;
+    if principal > 0 && blend_healthy {
         let usdc_token = soroban_sdk::token::Client::new(env, &usdc);
         let usdc_before_withdraw = usdc_token.balance(&env.current_contract_address());
         blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, i128::MAX);
