@@ -23,28 +23,39 @@ network_passphrase = "Test SDF Network ; September 2015"
 friendbot_url = "https://friendbot-testnet.stellar.org/"
 
 [warpdrive]
-port = 8000
+# Project-scoped ports so this operator can coexist with another
+# WarpDrive deploy on the same VPS (e.g. legacy hodlers operator on
+# 8000/9000). If you only run this one operator, 8000 is fine.
+port = 8010
 dev_endpoints_enabled = true
 ipfs_gateway = "https://gateway.pinata.cloud/ipfs/"
-host = "0.0.0.0"
+# HTTP API bind address. Default `127.0.0.1` keeps the (unauthenticated!)
+# API loopback-only — laptops reach it via the SSH tunnel established by
+# `task vps:tunnel`. Flip to `0.0.0.0` ONLY if you genuinely need
+# external HTTP access (e.g. a dashboard running on a separate host
+# without a tunnel) AND have an authenticating reverse proxy in front.
+host = "127.0.0.1"
 
 # ── P2P ────────────────────────────────────────────────────────────────
 # Per-operator config. Production target: 5-7 operators (per
 # PHOENIX_BLEND_AUTOMATION.md), quorum 4-of-5 or 5-of-7.
 #
+# For 1-of-1 solo testnet the libp2p listener still binds but no peers
+# ever connect — bootstrap_nodes = [] is correct and port 9010 can stay
+# closed at the firewall.
+#
 # operator-1 (bootstrap, this default):
 [warpdrive.p2p.remote]
-listen_port = 9000
+listen_port = 9010
 bootstrap_nodes = []
-#
-# operator-N (N >= 2): replace the section above with explicit bootstrap_nodes:
+# Each operator's libp2p port (9000) must then be open to the other
+# operators' IPs at the firewall.
 #
 # [warpdrive.p2p.remote]
 # listen_port = 9000
 # bootstrap_nodes = [
 #     "/ip4/<operator-1-ip>/tcp/9000/p2p/<operator-1-peer-id>",
 # ]
-
 [cli]
 
 [cli.chains.stellar.pubnet]

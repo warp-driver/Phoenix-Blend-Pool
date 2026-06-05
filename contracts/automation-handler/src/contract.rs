@@ -353,14 +353,13 @@ impl AutomationHandler {
                 .saturating_sub(before);
 
             if redeemed > 0 {
-                let pool_client = BlendedPoolClient::new(&env, &blended_pool);
                 let deposit_amount = redeemed.min(principal_before);
                 if deposit_amount > 0 {
-                    pool_client.deposit_from_delegate(&usdc, &deposit_amount);
+                    deposit_from_delegate(&env, &blended_pool, &usdc, deposit_amount);
                 }
                 let donate_amount = redeemed.saturating_sub(principal_before);
                 if donate_amount > 0 {
-                    pool_client.donate(&usdc, &donate_amount);
+                    donate_to_pool(&env, &blended_pool, &usdc, donate_amount);
                 }
             }
         }
@@ -442,12 +441,12 @@ impl AutomationHandler {
         let xlm = storage::get_xlm(&env);
 
         blend_submit(&env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, amount);
-        let pool_client = BlendedPoolClient::new(&env, &blended_pool);
-        pool_client.deposit_from_delegate(&usdc, &amount);
+        deposit_from_delegate(&env, &blended_pool, &usdc, amount);
 
         let principal_after = (principal_before - amount).max(0);
         storage::set_principal_supplied(&env, principal_after);
 
+        let pool_client = BlendedPoolClient::new(&env, &blended_pool);
         let state = pool_client.query_delegate_state();
         let (liquid_after, delegated_after) = if usdc < xlm {
             (state.liquid_a, state.delegated_a)
@@ -714,7 +713,7 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         };
         if amount > 0 {
             blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, amount);
-            pool_client.deposit_from_delegate(&usdc, &amount);
+            deposit_from_delegate(env, &blended_pool, &usdc, amount);
             let principal_after = (principal - amount).max(0);
             storage::set_principal_supplied(env, principal_after);
             storage::set_last_rebalance_ts(env, now);
@@ -803,8 +802,7 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
 
         let interest = actual_redeemable.saturating_sub(supply_amount);
         if interest > 0 {
-            let pool_client = BlendedPoolClient::new(env, &blended_pool);
-            pool_client.donate(&usdc, &interest);
+            donate_to_pool(env, &blended_pool, &usdc, interest);
             interest_donated = interest;
         }
     }
@@ -836,6 +834,39 @@ fn assert_no_usdc_residue(env: &Env) {
     storage::extend_instance_ttl(env);
 }
 
+/// Pre-authorize a nested `token.transfer(from = handler, to = recipient, amount)`
+/// sub-invocation. Required before any handler call that triggers a nested
+/// pull-from-handler — Blend's `submit(SUPPLY)`, the blended pool's
+/// `deposit_from_delegate`, the blended pool's `donate`. The SDK's
+/// automatic direct-call auth covers only invocations the handler issues
+/// itself; nested transfers initiated by Blend's or the pool's code need
+/// this explicit handshake or the recording-auth pass fails with
+/// `Error(Auth, InvalidAction)`.
+fn authorize_handler_transfer(
+    env: &Env,
+    token: &soroban_sdk::Address,
+    recipient: &soroban_sdk::Address,
+    amount: i128,
+) {
+    let args: Vec<Val> = vec![
+        env,
+        env.current_contract_address().into_val(env),
+        recipient.into_val(env),
+        amount.into_val(env),
+    ];
+    env.authorize_as_current_contract(vec![
+        env,
+        InvokerContractAuthEntry::Contract(SubContractInvocation {
+            context: ContractContext {
+                contract: token.clone(),
+                fn_name: Symbol::new(env, "transfer"),
+                args,
+            },
+            sub_invocations: vec![env],
+        }),
+    ]);
+}
+
 fn blend_submit(
     env: &Env,
     blend_pool: &soroban_sdk::Address,
@@ -850,31 +881,11 @@ fn blend_submit(
         address: token.clone(),
         amount,
     });
-    // BLEND_REQUEST_SUPPLY: Blend's `submit` internally calls
-    //   token.transfer(from = handler, to = blend_pool, amount)
-    // which is a nested sub-invocation that the SDK's automatic
-    // direct-call auth does NOT cover. Pre-authorize it as the invoker
-    // contract so Blend's recording-auth pass passes. WITHDRAW pushes
-    // tokens FROM the pool, so the pool authorizes its own transfer and
-    // we don't need to declare anything here.
+    // SUPPLY triggers `token.transfer(handler → blend_pool, amount)` inside
+    // Blend's submit. WITHDRAW pushes tokens FROM the pool, so no handler
+    // pre-auth is needed.
     if request_type == BLEND_REQUEST_SUPPLY {
-        let args: Vec<Val> = vec![
-            env,
-            env.current_contract_address().into_val(env),
-            blend_pool.into_val(env),
-            amount.into_val(env),
-        ];
-        env.authorize_as_current_contract(vec![
-            env,
-            InvokerContractAuthEntry::Contract(SubContractInvocation {
-                context: ContractContext {
-                    contract: token.clone(),
-                    fn_name: Symbol::new(env, "transfer"),
-                    args,
-                },
-                sub_invocations: vec![env],
-            }),
-        ]);
+        authorize_handler_transfer(env, token, blend_pool, amount);
     }
     blend.submit(
         &env.current_contract_address(),
@@ -882,6 +893,32 @@ fn blend_submit(
         &env.current_contract_address(),
         &requests,
     );
+}
+
+/// Wrapper around `blended_pool.deposit_from_delegate(token, amount)` that
+/// pre-authorizes the nested `token.transfer(handler → blended_pool)` the
+/// pool issues internally.
+fn deposit_from_delegate(
+    env: &Env,
+    blended_pool: &soroban_sdk::Address,
+    token: &soroban_sdk::Address,
+    amount: i128,
+) {
+    authorize_handler_transfer(env, token, blended_pool, amount);
+    BlendedPoolClient::new(env, blended_pool).deposit_from_delegate(token, &amount);
+}
+
+/// Wrapper around `blended_pool.donate(token, amount)` that pre-authorizes
+/// the nested `token.transfer(handler → blended_pool)` the pool issues
+/// internally.
+fn donate_to_pool(
+    env: &Env,
+    blended_pool: &soroban_sdk::Address,
+    token: &soroban_sdk::Address,
+    amount: i128,
+) {
+    authorize_handler_transfer(env, token, blended_pool, amount);
+    BlendedPoolClient::new(env, blended_pool).donate(token, &amount);
 }
 
 /// Saturating-checked `a * b / c`.
