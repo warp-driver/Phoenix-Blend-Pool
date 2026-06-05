@@ -1,0 +1,531 @@
+version: '3'
+
+# Stellar testnet end-to-end bring-up for phoenix-blend-pool.
+#
+# Pre-supplied production-grade artefacts on Stellar testnet (Blend "TestnetV2"
+# deploy, June 2026):
+#
+#   BLEND_POOL         CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF
+#   USDC               CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU
+#   XLM                CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC
+#   BLND               CB22KRA3YZVCNCQI64JQ5WE7UY2VAV7WFLK6A2JN3HEX56T2EDAFO7QF
+#   backstopV2         CBDVWXT433PRVTUNM56C3JREF3HIZHRBA64NB2C3B2UNCKIS65ZYCLZA
+#   emitter            CC3WJVJINN4E3LPMNTWKK7LQZLYDQMZHZA7EZGXATPHHBPKNZRIO3KZ6
+#   poolFactoryV2      CDV6RX4CGPCOKGTBFS52V3LMWQGZN3LCQTXF5RVPOOCG4XVMHXQ4NTF6
+#
+# What this taskfile does (in order):
+#
+#   testnet:preflight             check toolchain, DEPLOYER_*, sibling phoenix-contracts
+#   testnet:build-phoenix-wasms   build pool_blended + stake + token wasms
+#   testnet:upload-phoenix-wasms  install stake + token wasms on chain; capture hashes
+#   testnet:deploy-phoenix-pool   deploy phoenix_pool_blended with USDC-XLM pair
+#   testnet:lookup-usdc-reserve   query Blend pool for USDC reserve index → token_id
+#   testnet:deploy-handler-stack  build + deploy security / verification / handler
+#   testnet:set-delegate          wire handler as blended-pool delegate
+#   testnet:verify-deploy         cross-check query_state against env
+#   testnet:full                  runs everything above in sequence
+#
+# Optional follow-ups (require funded testnet USDC + XLM in DEPLOYER_ADDRESS):
+#
+#   testnet:seed-pool             provide initial liquidity to the blended pool
+#   testnet:seed-blend             manual_to_blend a chunk of USDC into Blend
+#
+# Outputs land under ./out/testnet/. The handler stack writes to ./out/.
+#
+# Run sequence for the impatient:
+#
+#   stellar keys generate phoenix-blend-deployer --fund --network testnet
+#   export DEPLOYER_SECRET=$(stellar keys show phoenix-blend-deployer)
+#   export DEPLOYER_ADDRESS=$(stellar keys address phoenix-blend-deployer)
+#   task testnet:full
+#
+# Override knobs (each tunable via env):
+#
+#   PHOENIX_REPO              sibling phoenix-contracts checkout (default: ../phoenix-contracts)
+#   POOL_SWAP_FEE_BPS         default 30   (0.30% per swap)
+#   POOL_MAX_SLIPPAGE_BPS     default 5000 (50% — Phoenix convention)
+#   POOL_DEFAULT_SLIPPAGE_BPS default 50   (0.5%)
+#   POOL_MAX_SPREAD_BPS       default 500  (5%)
+#   POOL_MAX_REFERRAL_BPS     default 500  (5%)
+#   POOL_MAX_FEE_BPS          default 1000 (10% ceiling)
+#   TARGET_RATIO_BPS          default 5000 (50% target liquid USDC)
+#   REBALANCE_BAND_BPS        default 500  (±5% band)
+#   MIN_TOTAL_USDC            default 1_000_000_000  (100 USDC at 7dp)
+#   REBALANCE_COOLDOWN_SECS   default 60   (1 minute for fast testnet iteration)
+#   XLM_SEED / USDC_SEED      default 10_000_000_000 (1000 XLM / 1000 USDC at 7dp)
+#   BLND_TREASURY             default: DEPLOYER_ADDRESS
+
+vars:
+  # Endpoints
+  RPC_URL: '{{.RPC_URL | default "https://soroban-testnet.stellar.org"}}'
+  NETWORK_PASSPHRASE: '{{.NETWORK_PASSPHRASE | default "Test SDF Network ; September 2015"}}'
+
+  # Blend TestnetV2 contracts
+  BLEND_POOL: '{{.BLEND_POOL | default "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF"}}'
+  USDC: '{{.USDC | default "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU"}}'
+  XLM: '{{.XLM | default "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC"}}'
+  BLND: '{{.BLND | default "CB22KRA3YZVCNCQI64JQ5WE7UY2VAV7WFLK6A2JN3HEX56T2EDAFO7QF"}}'
+
+  # Sibling repo
+  PHOENIX_REPO: '{{.PHOENIX_REPO | default "../phoenix-contracts"}}'
+  PHOENIX_WASM_DIR: '{{.PHOENIX_REPO | default "../phoenix-contracts"}}/target/wasm32v1-none/release'
+
+  # Phoenix pool init defaults (i64 fields; Soroban-CLI accepts decimal literals)
+  POOL_SWAP_FEE_BPS: '{{.POOL_SWAP_FEE_BPS | default "30"}}'
+  POOL_MAX_SLIPPAGE_BPS: '{{.POOL_MAX_SLIPPAGE_BPS | default "5000"}}'
+  POOL_DEFAULT_SLIPPAGE_BPS: '{{.POOL_DEFAULT_SLIPPAGE_BPS | default "50"}}'
+  POOL_MAX_SPREAD_BPS: '{{.POOL_MAX_SPREAD_BPS | default "500"}}'
+  POOL_MAX_REFERRAL_BPS: '{{.POOL_MAX_REFERRAL_BPS | default "500"}}'
+  POOL_MAX_FEE_BPS: '{{.POOL_MAX_FEE_BPS | default "1000"}}'
+  POOL_SHARE_TOKEN_NAME: '{{.POOL_SHARE_TOKEN_NAME | default "Phoenix XLM-USDC Blended LP"}}'
+  POOL_SHARE_TOKEN_SYMBOL: '{{.POOL_SHARE_TOKEN_SYMBOL | default "PHO-XU-B"}}'
+  # Stake init (placeholders; minimums needed to satisfy the type — we don't drive staking on testnet)
+  STAKE_MIN_BOND: '{{.STAKE_MIN_BOND | default "1000"}}'
+  STAKE_MIN_REWARD: '{{.STAKE_MIN_REWARD | default "1000"}}'
+  STAKE_MAX_COMPLEXITY: '{{.STAKE_MAX_COMPLEXITY | default "10"}}'
+
+  # Handler policy. MIN_TOTAL_USDC is the floor of total pool USDC below
+  # which Rebalance is a no-op; below this the handler refuses to touch
+  # Blend. Mainnet default is 10000 USDC in the root Taskfile; testnet
+  # uses 1000 USDC so a 4.5k-USDC pool clears the floor with ~4.5x margin.
+  TARGET_RATIO_BPS: '{{.TARGET_RATIO_BPS | default "5000"}}'
+  REBALANCE_BAND_BPS: '{{.REBALANCE_BAND_BPS | default "500"}}'
+  MIN_TOTAL_USDC: '{{.MIN_TOTAL_USDC | default "10000000000"}}'
+  REBALANCE_COOLDOWN_SECS: '{{.REBALANCE_COOLDOWN_SECS | default "60"}}'
+
+  # Liquidity seed defaults sized to a ~5k USDC + ~10k XLM deployer balance:
+  #   provide 4500 USDC + 9000 XLM to the pool, leaving ~500 USDC and
+  #   ~1000 XLM headroom for tx fees and re-runs. Half of the pool USDC
+  #   (2250 USDC) goes to Blend so the pool starts at exactly the 50% target.
+  XLM_SEED: '{{.XLM_SEED | default "90000000000"}}'
+  USDC_SEED: '{{.USDC_SEED | default "45000000000"}}'
+  BLEND_SEED_AMOUNT: '{{.BLEND_SEED_AMOUNT | default "22500000000"}}'
+
+tasks:
+  preflight:
+    desc: |
+      Check tooling + env. Fails fast if anything required is missing.
+      Sets up out/testnet/ for run artefacts.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required. Bootstrap: stellar keys generate phoenix-blend-deployer --fund --network testnet; export DEPLOYER_SECRET=\$(stellar keys show phoenix-blend-deployer)}"
+        : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required. export DEPLOYER_ADDRESS=\$(stellar keys address phoenix-blend-deployer)}"
+        command -v stellar >/dev/null || { echo "missing stellar-cli"; exit 1; }
+        command -v jq >/dev/null      || { echo "missing jq"; exit 1; }
+        command -v cargo-component >/dev/null || { echo "missing cargo-component (cargo install cargo-component)"; exit 1; }
+        test -d "{{.PHOENIX_REPO}}"   || { echo "PHOENIX_REPO not found at {{.PHOENIX_REPO}} — clone phoenix-contracts as a sibling"; exit 1; }
+        test -d "{{.PHOENIX_REPO}}/contracts/pool_blended" || { echo "{{.PHOENIX_REPO}}/contracts/pool_blended missing — wrong checkout?"; exit 1; }
+        mkdir -p out/testnet
+        echo "deployer: $DEPLOYER_ADDRESS"
+        echo "phoenix repo: {{.PHOENIX_REPO}}"
+        echo "preflight ok"
+
+  fund-deployer:
+    desc: |
+      Top up the deployer's XLM balance via friendbot. Idempotent: friendbot
+      caps the account at 10000 XLM and returns 400 once full, which this
+      task tolerates. USDC is NOT funded here — the issuer of testnet USDC
+      (GATALTGT...) does not expose a public faucet endpoint, and `mint` on
+      the SAC is admin-gated. Acquire USDC out of band (Blend Discord drip,
+      manual transfer from another funded account, etc.).
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
+        echo "requesting friendbot drip for $DEPLOYER_ADDRESS..."
+        HTTP=$(curl -sS -o /tmp/friendbot.json -w '%{http_code}' \
+            "https://friendbot.stellar.org/?addr=$DEPLOYER_ADDRESS" || echo "000")
+        case "$HTTP" in
+          200) echo "funded; new account created or balance topped up" ;;
+          400)
+            if grep -q 'createAccountAlreadyExist\|already exists' /tmp/friendbot.json 2>/dev/null; then
+              echo "account already exists; XLM balance unchanged (friendbot only funds new accounts)"
+            else
+              echo "friendbot returned 400:"; cat /tmp/friendbot.json; echo
+              echo "(continuing; existing balance may still be sufficient)"
+            fi
+            ;;
+          *) echo "friendbot HTTP $HTTP:"; cat /tmp/friendbot.json; exit 1 ;;
+        esac
+
+  check-balances:
+    desc: |
+      Print the deployer's XLM + USDC + BLND balances. Fast sanity check
+      before kicking off seed-pool / seed-blend. Fails with a clear error
+      if XLM balance is too low to cover deploy fees or USDC balance is
+      below USDC_SEED.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?}"
+        : "${DEPLOYER_ADDRESS:?}"
+        bal_of() {
+          stellar contract invoke \
+              --id "$1" \
+              --rpc-url "{{.RPC_URL}}" \
+              --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+              --source "$DEPLOYER_SECRET" \
+              -- balance --id "$DEPLOYER_ADDRESS" 2>/dev/null \
+            | tr -d '"' || echo "0"
+        }
+        XLM_BAL=$(bal_of "{{.XLM}}")
+        USDC_BAL=$(bal_of "{{.USDC}}")
+        BLND_BAL=$(bal_of "{{.BLND}}")
+        fmt() { awk -v n="$1" 'BEGIN { printf "%.4f", n / 10000000 }'; }
+        echo "deployer: $DEPLOYER_ADDRESS"
+        echo "  XLM:  $(fmt ${XLM_BAL:-0})  (raw $XLM_BAL)"
+        echo "  USDC: $(fmt ${USDC_BAL:-0})  (raw $USDC_BAL)"
+        echo "  BLND: $(fmt ${BLND_BAL:-0})  (raw $BLND_BAL)"
+        # Floor checks: need ~50 XLM for deploys + USDC >= USDC_SEED for seed-pool.
+        if [ "${XLM_BAL:-0}" -lt "500000000" ]; then
+          echo "WARN: XLM balance below 50 XLM. Run 'task testnet:fund-deployer'."
+        fi
+        if [ "${USDC_BAL:-0}" -lt "{{.USDC_SEED}}" ]; then
+          echo "WARN: USDC balance below USDC_SEED ({{.USDC_SEED}} raw). seed-pool will fail."
+        fi
+
+  build-phoenix-wasms:
+    desc: |
+      Build phoenix-pool-blended + phoenix-stake + soroban-token-contract
+      wasms in the sibling phoenix-contracts repo. The pool deploys instances
+      of stake + token at construction time, so both must be uploaded first
+      and their hashes passed into the constructor.
+    deps: [preflight]
+    cmds:
+      - cd "{{.PHOENIX_REPO}}" && stellar contract build --package phoenix-pool-blended
+      - cd "{{.PHOENIX_REPO}}" && stellar contract build --package phoenix-stake
+      - cd "{{.PHOENIX_REPO}}" && stellar contract build --package soroban-token-contract
+      - |
+        set -euo pipefail
+        for w in phoenix_pool_blended phoenix_stake soroban_token_contract; do
+          test -f "{{.PHOENIX_WASM_DIR}}/${w}.wasm" || { echo "missing build output: ${w}.wasm"; exit 1; }
+        done
+        echo "built: phoenix_pool_blended.wasm, phoenix_stake.wasm, soroban_token_contract.wasm"
+
+  upload-phoenix-wasms:
+    desc: |
+      Install phoenix_stake.wasm + soroban_token_contract.wasm as code on
+      Stellar testnet. Captures their 32-byte hashes for the pool constructor.
+      Writes out/testnet/phoenix-wasms.json.
+    deps: [build-phoenix-wasms]
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?}"
+        STAKE_HASH=$(stellar contract upload \
+            --wasm "{{.PHOENIX_WASM_DIR}}/phoenix_stake.wasm" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$DEPLOYER_SECRET")
+        TOKEN_HASH=$(stellar contract upload \
+            --wasm "{{.PHOENIX_WASM_DIR}}/soroban_token_contract.wasm" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$DEPLOYER_SECRET")
+        jq -n --arg s "$STAKE_HASH" --arg t "$TOKEN_HASH" \
+            '{stake_wasm_hash: $s, token_wasm_hash: $t}' \
+            > out/testnet/phoenix-wasms.json
+        echo "stake_wasm_hash=$STAKE_HASH"
+        echo "token_wasm_hash=$TOKEN_HASH"
+
+  deploy-phoenix-pool:
+    desc: |
+      Deploy phoenix_pool_blended with USDC + XLM. Token order: USDC sorts
+      alphabetically below XLM, so token_a = USDC (the side the handler
+      manages), token_b = XLM. factory_addr is set to DEPLOYER_ADDRESS for
+      testnet (Phoenix uses a real factory in production).
+      Writes out/testnet/pool.json with the pool C-address.
+    deps: [upload-phoenix-wasms]
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?}"
+        : "${DEPLOYER_ADDRESS:?}"
+        STAKE_HASH=$(jq -r .stake_wasm_hash out/testnet/phoenix-wasms.json)
+        TOKEN_HASH=$(jq -r .token_wasm_hash out/testnet/phoenix-wasms.json)
+        TOKEN_A="{{.USDC}}"
+        TOKEN_B="{{.XLM}}"
+
+        # Soroban CLI accepts contracttype struct args as JSON. The pool
+        # constructor takes the LiquidityPoolInitInfo struct nested with
+        # TokenInitInfo + StakeInitInfo.
+        LP_INIT=$(jq -nc \
+            --arg admin "$DEPLOYER_ADDRESS" \
+            --arg fee_recipient "$DEPLOYER_ADDRESS" \
+            --arg manager "$DEPLOYER_ADDRESS" \
+            --arg token_a "$TOKEN_A" \
+            --arg token_b "$TOKEN_B" \
+            --argjson swap_fee_bps {{.POOL_SWAP_FEE_BPS}} \
+            --argjson max_allowed_slippage_bps {{.POOL_MAX_SLIPPAGE_BPS}} \
+            --argjson default_slippage_bps {{.POOL_DEFAULT_SLIPPAGE_BPS}} \
+            --argjson max_allowed_spread_bps {{.POOL_MAX_SPREAD_BPS}} \
+            --argjson max_referral_bps {{.POOL_MAX_REFERRAL_BPS}} \
+            --argjson min_bond {{.STAKE_MIN_BOND}} \
+            --argjson min_reward {{.STAKE_MIN_REWARD}} \
+            --argjson max_complexity {{.STAKE_MAX_COMPLEXITY}} \
+            '{
+              admin: $admin,
+              swap_fee_bps: $swap_fee_bps,
+              fee_recipient: $fee_recipient,
+              max_allowed_slippage_bps: $max_allowed_slippage_bps,
+              default_slippage_bps: $default_slippage_bps,
+              max_allowed_spread_bps: $max_allowed_spread_bps,
+              max_referral_bps: $max_referral_bps,
+              token_init_info: { token_a: $token_a, token_b: $token_b },
+              stake_init_info: {
+                min_bond: $min_bond,
+                min_reward: $min_reward,
+                manager: $manager,
+                max_complexity: $max_complexity
+              }
+            }')
+
+        POOL_ADDR=$(stellar contract deploy \
+            --wasm "{{.PHOENIX_WASM_DIR}}/phoenix_pool_blended.wasm" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$DEPLOYER_SECRET" \
+            -- \
+            --stake_wasm_hash "$STAKE_HASH" \
+            --token_wasm_hash "$TOKEN_HASH" \
+            --lp_init_info "$LP_INIT" \
+            --factory_addr "$DEPLOYER_ADDRESS" \
+            --share_token_name "{{.POOL_SHARE_TOKEN_NAME}}" \
+            --share_token_symbol "{{.POOL_SHARE_TOKEN_SYMBOL}}" \
+            --default_slippage_bps "{{.POOL_DEFAULT_SLIPPAGE_BPS}}" \
+            --max_allowed_fee_bps "{{.POOL_MAX_FEE_BPS}}")
+
+        jq -n --arg p "$POOL_ADDR" --arg a "$TOKEN_A" --arg b "$TOKEN_B" \
+            '{blended_pool: $p, token_a: $a, token_b: $b}' \
+            > out/testnet/pool.json
+        echo "BLENDED_POOL=$POOL_ADDR"
+
+  lookup-usdc-reserve:
+    desc: |
+      Query Blend's testnet lending pool for the reserve list, find USDC's
+      index, derive its b-token id (= index * 2 + 1). The handler claims
+      against this id during HarvestYield. Writes out/testnet/blend-reserves.json.
+    deps: [preflight]
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?}"
+        RAW=$(stellar contract invoke \
+            --id "{{.BLEND_POOL}}" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$DEPLOYER_SECRET" \
+            -- get_reserve_list)
+        echo "reserve list: $RAW"
+        IDX=$(printf '%s' "$RAW" | jq -r --arg u "{{.USDC}}" \
+            '[. | to_entries[] | select(.value == $u) | .key] | .[0] // empty')
+        if [ -z "$IDX" ] || [ "$IDX" = "null" ]; then
+          echo "ERROR: USDC ({{.USDC}}) not found in Blend pool {{.BLEND_POOL}} reserve_list"
+          echo "Blend may not have registered USDC as a reserve on this pool; coordinate with Blend team."
+          exit 1
+        fi
+        TOKEN_ID=$((IDX * 2 + 1))
+        jq -n --argjson i "$IDX" --argjson t "$TOKEN_ID" \
+            '{usdc_index: $i, usdc_reserve_token_id: $t}' \
+            > out/testnet/blend-reserves.json
+        echo "usdc_index=$IDX usdc_reserve_token_id=$TOKEN_ID"
+
+  deploy-handler-stack:
+    desc: |
+      Build + deploy ed25519-security, ed25519-verification, automation-handler
+      with the testnet config (real BLENDED_POOL + BLEND_POOL + USDC + XLM +
+      USDC_RESERVE_TOKEN_ID + policy). HANDLER_ADMIN defaults to DEPLOYER_ADDRESS;
+      BLND_TREASURY defaults to DEPLOYER_ADDRESS (testnet — pick a multisig for mainnet).
+    deps: [deploy-phoenix-pool, lookup-usdc-reserve]
+    cmds:
+      - |
+        set -euo pipefail
+        BLENDED_POOL=$(jq -r .blended_pool out/testnet/pool.json)
+        USDC_RESERVE_TOKEN_ID=$(jq -r .usdc_reserve_token_id out/testnet/blend-reserves.json)
+        BLND_TREASURY="${BLND_TREASURY:-$DEPLOYER_ADDRESS}"
+
+        BLENDED_POOL="$BLENDED_POOL" \
+        BLEND_POOL="{{.BLEND_POOL}}" \
+        USDC="{{.USDC}}" \
+        XLM="{{.XLM}}" \
+        BLND_TREASURY="$BLND_TREASURY" \
+        USDC_RESERVE_TOKEN_ID="$USDC_RESERVE_TOKEN_ID" \
+        TARGET_RATIO_BPS="{{.TARGET_RATIO_BPS}}" \
+        REBALANCE_BAND_BPS="{{.REBALANCE_BAND_BPS}}" \
+        MIN_TOTAL_USDC="{{.MIN_TOTAL_USDC}}" \
+        REBALANCE_COOLDOWN_SECS="{{.REBALANCE_COOLDOWN_SECS}}" \
+        HANDLER_ADMIN="$DEPLOYER_ADDRESS" \
+        RPC_URL="{{.RPC_URL}}" \
+        NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
+        task -t Taskfile.yml deploy
+
+  set-delegate:
+    desc: Wire the deployed automation-handler as the blended pool's delegate.
+    deps: [deploy-handler-stack]
+    cmds:
+      - |
+        set -euo pipefail
+        BLENDED_POOL=$(jq -r .blended_pool out/testnet/pool.json)
+        BLENDED_POOL="$BLENDED_POOL" \
+        RPC_URL="{{.RPC_URL}}" \
+        NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
+        task -t Taskfile.yml set-delegate
+
+  verify-deploy:
+    desc: Cross-check the deployed surface against env (query_state + pool delegate).
+    cmds:
+      - |
+        set -euo pipefail
+        BLENDED_POOL=$(jq -r .blended_pool out/testnet/pool.json)
+        USDC_RESERVE_TOKEN_ID=$(jq -r .usdc_reserve_token_id out/testnet/blend-reserves.json)
+        BLND_TREASURY="${BLND_TREASURY:-$DEPLOYER_ADDRESS}"
+
+        BLENDED_POOL="$BLENDED_POOL" \
+        BLEND_POOL="{{.BLEND_POOL}}" \
+        USDC="{{.USDC}}" \
+        XLM="{{.XLM}}" \
+        BLND_TREASURY="$BLND_TREASURY" \
+        USDC_RESERVE_TOKEN_ID="$USDC_RESERVE_TOKEN_ID" \
+        TARGET_RATIO_BPS="{{.TARGET_RATIO_BPS}}" \
+        REBALANCE_BAND_BPS="{{.REBALANCE_BAND_BPS}}" \
+        MIN_TOTAL_USDC="{{.MIN_TOTAL_USDC}}" \
+        REBALANCE_COOLDOWN_SECS="{{.REBALANCE_COOLDOWN_SECS}}" \
+        RPC_URL="{{.RPC_URL}}" \
+        NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
+        task -t Taskfile.yml verify-deploy
+
+  full:
+    desc: |
+      End-to-end testnet bring-up: fund (XLM via friendbot) → check balances
+      → phoenix wasms → phoenix pool deploy → Blend USDC reserve lookup →
+      handler stack → set-delegate → verify. Does NOT seed liquidity by
+      default — run testnet:seed-pool + testnet:seed-blend after this if
+      your deployer has USDC.
+    cmds:
+      - task: preflight
+      - task: fund-deployer
+      - task: check-balances
+      - task: build-phoenix-wasms
+      - task: upload-phoenix-wasms
+      - task: deploy-phoenix-pool
+      - task: lookup-usdc-reserve
+      - task: deploy-handler-stack
+      - task: set-delegate
+      - task: verify-deploy
+      - |
+        echo
+        echo "=========================================="
+        echo "Testnet bring-up complete."
+        echo
+        echo "Phoenix blended pool:"
+        cat out/testnet/pool.json | jq .
+        echo
+        echo "Blend USDC reserve:"
+        cat out/testnet/blend-reserves.json | jq .
+        echo
+        echo "Handler:"
+        cat out/handler.json | jq .
+        echo "=========================================="
+        echo "Next steps:"
+        echo "  1. Fund deployer with testnet XLM + USDC if not already."
+        echo "  2. task testnet:seed-pool      # add initial liquidity"
+        echo "  3. task testnet:seed-blend     # push half of USDC into Blend"
+        echo "  4. task run-node               # start operator node"
+        echo "  5. task wire-service           # register the WarpDrive service"
+        echo "=========================================="
+
+  # --- Optional follow-ups (require funded deployer) -------------------------
+
+  seed-pool:
+    desc: |
+      Provide initial XLM + USDC liquidity to the pool. Override XLM_SEED /
+      USDC_SEED to pick amounts (raw i128 at 7 decimals). The deployer MUST
+      already hold both tokens (use friendbot for XLM; testnet USDC requires
+      a Circle / Blend faucet or pre-existing balance — `stellar tx send`
+      a Stellar Classic payment to the deployer address from a funded source).
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?}"
+        : "${DEPLOYER_ADDRESS:?}"
+        BLENDED_POOL=$(jq -r .blended_pool out/testnet/pool.json)
+
+        echo "providing {{.USDC_SEED}} USDC (token_a) + {{.XLM_SEED}} XLM (token_b)"
+        stellar contract invoke \
+            --id "$BLENDED_POOL" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$DEPLOYER_SECRET" \
+            -- provide_liquidity \
+              --depositor "$DEPLOYER_ADDRESS" \
+              --desired_a "{{.USDC_SEED}}" \
+              --min_a "{{.USDC_SEED}}" \
+              --desired_b "{{.XLM_SEED}}" \
+              --min_b "{{.XLM_SEED}}" \
+              --auto_stake false
+        echo "pool seeded"
+
+  seed-blend:
+    desc: |
+      Push BLEND_SEED_AMOUNT USDC from the pool into Blend via admin
+      manual_to_blend. Default seeds half of USDC_SEED into Blend so the
+      pool starts at the 50% target.
+    cmds:
+      - |
+        set -euo pipefail
+        AMOUNT="{{.BLEND_SEED_AMOUNT}}" \
+        RPC_URL="{{.RPC_URL}}" \
+        NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
+        task -t Taskfile.yml manual-to-blend
+
+  # --- Inspection / debug helpers -------------------------------------------
+
+  status:
+    desc: Print what's deployed so far. Reads out/testnet/*.json and out/handler.json.
+    cmds:
+      - |
+        set -euo pipefail
+        echo "== testnet deploy status =="
+        for f in out/testnet/pool.json out/testnet/blend-reserves.json \
+                 out/testnet/phoenix-wasms.json out/deploy.json out/handler.json; do
+          if [ -f "$f" ]; then
+            echo
+            echo "$f:"
+            jq . "$f"
+          else
+            echo
+            echo "$f: (not present)"
+          fi
+        done
+
+  pool-state:
+    desc: Dump the deployed pool's query_pool_info + query_delegate_state.
+    cmds:
+      - |
+        set -euo pipefail
+        BLENDED_POOL=$(jq -r .blended_pool out/testnet/pool.json)
+        echo "== query_pool_info =="
+        stellar contract invoke \
+            --id "$BLENDED_POOL" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$DEPLOYER_SECRET" \
+            -- query_pool_info | jq .
+        echo
+        echo "== query_delegate_state =="
+        stellar contract invoke \
+            --id "$BLENDED_POOL" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$DEPLOYER_SECRET" \
+            -- query_delegate_state | jq .
+
+  reset:
+    desc: |
+      Remove out/testnet/. Does NOT touch out/handler.json or out/deploy.json
+      (those are managed by the root Taskfile). Lets you re-run the phoenix
+      pool deploy without redoing everything.
+    cmds:
+      - rm -rf out/testnet
+      - echo "out/testnet cleared"

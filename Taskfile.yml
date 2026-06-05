@@ -47,6 +47,11 @@ version: '3'
 #   out/service.cid        IPFS CID returned by `task pin-service`.
 #   out/signer.json        Raw SignerResponse from POST /services/signer.
 
+includes:
+  testnet:
+    taskfile: ./taskfiles/testnet.yml
+    optional: false
+
 vars:
   RPC_URL: '{{.RPC_URL | default "https://soroban-testnet.stellar.org"}}'
   NETWORK_PASSPHRASE: '{{.NETWORK_PASSPHRASE | default "Test SDF Network ; September 2015"}}'
