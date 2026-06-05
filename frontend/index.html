@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>phoenix-blend-display</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/@stellar/stellar-sdk@15.1.0/dist/stellar-sdk.min.js" defer></script>
+  <script src="https://unpkg.com/@stellar/freighter-api@6.0.1/build/index.min.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="scanlines" aria-hidden="true"></div>
+
+  <header>
+    <h1>phoenix<span class="dim">/</span>blend<span class="dim">::</span>monitor</h1>
+    <div class="meta">
+      <span id="net-badge" class="badge">--</span>
+      <span class="status">
+        <span class="dot" id="conn-dot"></span>
+        <span id="conn-text">connecting</span>
+      </span>
+      <span class="ts">tick <span id="last-tick">--</span></span>
+      <span class="wallet">
+        <button id="btn-connect" class="btn-wallet" type="button">Connect Freighter</button>
+        <span id="wallet-display" hidden>
+          <span class="wallet-addr" id="wallet-addr-display">--</span>
+          <button id="btn-disconnect" class="btn-wallet-sm" type="button">disconnect</button>
+        </span>
+      </span>
+    </div>
+  </header>
+
+  <main>
+    <!-- Row 0: Actions (visible when Freighter connected). -->
+    <section class="row" id="row-actions" hidden>
+      <article class="panel wide" id="panel-actions">
+        <h2>
+          Pool actions
+          <span class="dim subhead">— deposit + withdraw + swap on the blended pool, signed by your connected Freighter wallet</span>
+        </h2>
+
+        <div class="tabs">
+          <button class="tab active" data-tab="deposit"  type="button">Deposit</button>
+          <button class="tab"         data-tab="withdraw" type="button">Withdraw</button>
+          <button class="tab"         data-tab="swap"     type="button">Swap</button>
+        </div>
+
+        <!-- Deposit tab -->
+        <div class="tab-body active" data-tab-body="deposit">
+          <form id="form-deposit" class="action-form">
+            <div class="form-hint" id="deposit-hint">
+              Pool ratio: <span id="deposit-pool-ratio">--</span> XLM / USDC.
+              <button type="button" id="btn-deposit-match" class="btn-max">match ratio</button>
+            </div>
+            <label>
+              <span>USDC amount</span>
+              <input type="text" inputmode="decimal" id="deposit-usdc" placeholder="10.0" />
+            </label>
+            <label>
+              <span>XLM amount</span>
+              <input type="text" inputmode="decimal" id="deposit-xlm" placeholder="20.0" />
+            </label>
+            <label>
+              <span>Min USDC out (slippage)</span>
+              <input type="text" inputmode="decimal" id="deposit-min-usdc" placeholder="0 = no minimum" />
+            </label>
+            <label>
+              <span>Min XLM out (slippage)</span>
+              <input type="text" inputmode="decimal" id="deposit-min-xlm" placeholder="0 = no minimum" />
+            </label>
+            <label>
+              <span>Custom slippage (bps)</span>
+              <input type="text" inputmode="numeric" id="deposit-slippage" placeholder="(default from pool config; raise for off-ratio deposits)" />
+            </label>
+            <button type="submit" class="btn-action">Provide liquidity</button>
+            <div class="action-result" id="deposit-result"></div>
+          </form>
+        </div>
+
+        <!-- Withdraw tab -->
+        <div class="tab-body" data-tab-body="withdraw">
+          <form id="form-withdraw" class="action-form">
+            <label>
+              <span>LP share amount
+                <button type="button" class="btn-max" id="btn-withdraw-max">max: <span id="withdraw-lp-bal">--</span></button>
+              </span>
+              <input type="text" inputmode="decimal" id="withdraw-shares" placeholder="0.0" />
+            </label>
+            <label>
+              <span>Min USDC out</span>
+              <input type="text" inputmode="decimal" id="withdraw-min-usdc" placeholder="0" />
+            </label>
+            <label>
+              <span>Min XLM out</span>
+              <input type="text" inputmode="decimal" id="withdraw-min-xlm" placeholder="0" />
+            </label>
+            <button type="submit" class="btn-action">Withdraw liquidity</button>
+            <div class="action-result" id="withdraw-result"></div>
+          </form>
+        </div>
+
+        <!-- Swap tab -->
+        <div class="tab-body" data-tab-body="swap">
+          <form id="form-swap" class="action-form">
+            <label>
+              <span>Direction</span>
+              <select id="swap-direction">
+                <option value="xlm-to-usdc">XLM → USDC</option>
+                <option value="usdc-to-xlm">USDC → XLM</option>
+              </select>
+            </label>
+            <label>
+              <span>Offer amount (<span id="swap-offer-token">XLM</span>)</span>
+              <input type="text" inputmode="decimal" id="swap-offer" placeholder="10.0" />
+            </label>
+            <label>
+              <span>Min received (<span id="swap-ask-token">USDC</span>)</span>
+              <input type="text" inputmode="decimal" id="swap-min-ask" placeholder="(default: 0 = accept any)" />
+            </label>
+            <label>
+              <span>Max spread (bps)</span>
+              <input type="text" inputmode="numeric" id="swap-max-spread" placeholder="(default: pool max)" />
+            </label>
+            <button type="submit" class="btn-action">Swap</button>
+            <div class="action-result" id="swap-result"></div>
+          </form>
+        </div>
+      </article>
+    </section>
+
+    <!-- Row 1: Deployer wallet + Drift indicator -->
+    <section class="row row-thirds">
+      <article class="panel" id="panel-wallet">
+        <h2>Deployer wallet</h2>
+        <dl id="wallet-meta" class="kv">
+          <dt>address</dt><dd id="wallet-addr">--</dd>
+          <dt>XLM</dt>     <dd class="num" id="wallet-xlm">--</dd>
+          <dt>USDC</dt>    <dd class="num" id="wallet-usdc">--</dd>
+          <dt>BLND</dt>    <dd class="num" id="wallet-blnd">--</dd>
+        </dl>
+      </article>
+
+      <article class="panel wide-2" id="panel-drift">
+        <h2>Drift indicator</h2>
+        <div id="drift-readout">
+          <div class="drift-stats">
+            <span>liquid USDC: <b id="drift-liquid">--</b></span>
+            <span>delegated: <b id="drift-delegated">--</b></span>
+            <span>total: <b id="drift-total">--</b></span>
+            <span>actual: <b id="drift-pct">--</b></span>
+            <span>target: <b id="drift-target">--</b></span>
+          </div>
+          <div class="drift-bar">
+            <div class="drift-target-line" id="drift-target-line"></div>
+            <div class="drift-band" id="drift-band"></div>
+            <div class="drift-marker" id="drift-marker" title="current liquid_usdc / total_usdc"></div>
+            <div class="drift-labels">
+              <span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span>
+            </div>
+          </div>
+          <div class="drift-action">
+            predicted next Rebalance: <b id="drift-action">--</b>
+            <span class="dim" id="drift-action-reason"></span>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <!-- Row 2: Pool state + Blend position -->
+    <section class="row">
+      <article class="panel" id="panel-pool">
+        <h2>Phoenix pool state</h2>
+        <table id="tbl-pool">
+          <thead>
+            <tr>
+              <th>Token</th>
+              <th class="num">Liquid</th>
+              <th class="num">Delegated</th>
+              <th class="num">Total</th>
+              <th class="num">% liq</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="5" class="loading">awaiting first read…</td></tr>
+          </tbody>
+        </table>
+        <dl id="pool-meta" class="kv">
+          <dt>delegate</dt><dd>--</dd>
+          <dt>token_a</dt><dd>--</dd>
+          <dt>token_b</dt><dd>--</dd>
+          <dt>LP shares</dt><dd>--</dd>
+          <dt>stake</dt><dd>--</dd>
+        </dl>
+      </article>
+
+      <article class="panel" id="panel-blend">
+        <h2>Blend position</h2>
+        <table id="tbl-blend">
+          <tbody>
+            <tr><td colspan="2" class="loading">awaiting first read…</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </section>
+
+    <!-- Row 3: Pool events -->
+    <section class="row">
+      <article class="panel wide" id="panel-pool-events">
+        <h2>
+          Pool events
+          <span class="dim subhead">— swap / provide_liquidity / withdraw_liquidity / donate / delegate ops on the blended pool. Each one triggers the WarpDrive circuit.</span>
+        </h2>
+        <table id="tbl-pool-events">
+          <thead>
+            <tr>
+              <th>Ledger</th>
+              <th>When</th>
+              <th>Event</th>
+              <th>Tx</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="4" class="loading">awaiting first read…</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </section>
+
+    <!-- Row 4: Handler events -->
+    <section class="row">
+      <article class="panel wide" id="panel-events">
+        <h2>
+          Handler events
+          <span class="dim subhead">— RebalanceExecuted / HarvestCompleted prove the off-chain pipeline closed the loop.</span>
+        </h2>
+        <table id="tbl-events">
+          <thead>
+            <tr>
+              <th>Ledger</th>
+              <th>When</th>
+              <th>Event</th>
+              <th>Data</th>
+              <th>Tx</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="5" class="loading">awaiting first read…</td></tr>
+          </tbody>
+        </table>
+      </article>
+    </section>
+  </main>
+
+  <footer>
+    <span class="addr-mini" id="handler-addr">handler: --</span>
+    <span class="addr-mini" id="pool-addr">pool: --</span>
+    <span class="err" id="err-line"></span>
+  </footer>
+</body>
+</html>

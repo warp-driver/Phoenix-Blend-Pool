@@ -1,5 +1,7 @@
 use soroban_sdk::{
-    contract, contractimpl, contracttype, xdr::FromXdr, Address, Bytes, BytesN, Env, String, Vec,
+    auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
+    contract, contractimpl, contracttype, vec, xdr::FromXdr, Address, Bytes, BytesN, Env,
+    IntoVal, String, Symbol, Val, Vec,
 };
 use warpdrive_shared::interfaces::{
     handler::{Ed25519SignatureData, HandlerError, Verified, XlmEnvelope},
@@ -848,6 +850,32 @@ fn blend_submit(
         address: token.clone(),
         amount,
     });
+    // BLEND_REQUEST_SUPPLY: Blend's `submit` internally calls
+    //   token.transfer(from = handler, to = blend_pool, amount)
+    // which is a nested sub-invocation that the SDK's automatic
+    // direct-call auth does NOT cover. Pre-authorize it as the invoker
+    // contract so Blend's recording-auth pass passes. WITHDRAW pushes
+    // tokens FROM the pool, so the pool authorizes its own transfer and
+    // we don't need to declare anything here.
+    if request_type == BLEND_REQUEST_SUPPLY {
+        let args: Vec<Val> = vec![
+            env,
+            env.current_contract_address().into_val(env),
+            blend_pool.into_val(env),
+            amount.into_val(env),
+        ];
+        env.authorize_as_current_contract(vec![
+            env,
+            InvokerContractAuthEntry::Contract(SubContractInvocation {
+                context: ContractContext {
+                    contract: token.clone(),
+                    fn_name: Symbol::new(env, "transfer"),
+                    args,
+                },
+                sub_invocations: vec![env],
+            }),
+        ]);
+    }
     blend.submit(
         &env.current_contract_address(),
         &env.current_contract_address(),

@@ -51,6 +51,9 @@ includes:
   testnet:
     taskfile: ./taskfiles/testnet.yml
     optional: false
+  vps:
+    taskfile: ./taskfiles/vps.yml
+    optional: false
 
 vars:
   RPC_URL: '{{.RPC_URL | default "https://soroban-testnet.stellar.org"}}'
@@ -84,7 +87,10 @@ vars:
   SIGNER_WEIGHT: '{{.SIGNER_WEIGHT | default "100"}}'
   THRESHOLD_NUM: '{{.THRESHOLD_NUM | default "1"}}'
   THRESHOLD_DEN: '{{.THRESHOLD_DEN | default "1"}}'
-  MIDDLEWARE_IMAGE: '{{.MIDDLEWARE_IMAGE | default "ghcr.io/warp-driver/warpdrive-stellar-middleware:latest"}}'
+  # Pinned to the same tag warpdrive (v3.0.0) consumes — see
+  # warpdrive/packages/utils/src/test_utils/middleware/stellar.rs
+  # (`STELLAR_MIDDLEWARE_IMAGE`). Bump in lockstep with the upstream pin.
+  MIDDLEWARE_IMAGE: '{{.MIDDLEWARE_IMAGE | default "ghcr.io/warp-driver/warpdrive-stellar-middleware:0.3.0-rc.1"}}'
   CIRCUIT_WASM: components/circuit/target/wasm32-wasip1/release/blend_rebalance_circuit.wasm
   AGGREGATOR_WASM: components/aggregator/target/wasm32-wasip1/release/blend_rebalance_aggregator.wasm
   SERVICE_FILE: '{{.SERVICE_FILE | default "service/service.json"}}'
@@ -171,18 +177,41 @@ tasks:
         PROJECT_ROOT=$(jq -r .contracts.project_root out/deploy.json)
         CIRCUIT_DIGEST=$(cat out/circuit.digest)
         AGG_DIGEST=$(cat out/aggregator.digest)
+        # Resolve the deployed blended pool C-address. Prefer an explicit
+        # BLENDED_POOL env override; fall back to out/testnet/pool.json
+        # written by `task testnet:deploy-phoenix-pool`. Bail loudly if
+        # neither yields a real strkey — better than baking the
+        # placeholder into service.json and confusing the operator.
+        BLENDED_POOL="${BLENDED_POOL:-{{.BLENDED_POOL}}}"
+        if [ -f out/testnet/pool.json ] && [ "$BLENDED_POOL" = "{{.BLENDED_POOL}}" ]; then
+          BLENDED_POOL=$(jq -r .blended_pool out/testnet/pool.json)
+        fi
+        case "$BLENDED_POOL" in
+          CB0*0)  echo "BLENDED_POOL is still the placeholder ($BLENDED_POOL)."
+                  echo "Run testnet:deploy-phoenix-pool first, or export BLENDED_POOL=C..."
+                  exit 1 ;;
+          C[A-Z0-9]*) : "valid C-strkey" ;;
+          *)      echo "BLENDED_POOL ($BLENDED_POOL) is not a Stellar contract C-strkey"
+                  exit 1 ;;
+        esac
+        echo "build-service: using BLENDED_POOL=$BLENDED_POOL"
         warpdrive-cli service -f {{.SERVICE_FILE}} init --name phoenix-blend-pool
 
-        # workflow 1: rebalance. rest-wildcard on the trigger delivers every
-        # pool event to the circuit; the circuit filters topic[0] to
-        # {swap, provide_liquidity, withdraw_liquidity} (all three move the
-        # liquid USDC ratio) and dedupes per tx_hash:op_index.
+        # workflow 1: rebalance. We pass a single `wildcard` topic so the
+        # filter has one segment at position 0 — Stellar's getEvents RPC
+        # rejects empty filters ("topic must have at least 1 segment"),
+        # and warpdrive's stellar stream encoder doesn't implement
+        # rest-wildcard yet (returns InvalidWildcard("**")). The wildcard
+        # matches any Symbol at position 0 — every Phoenix pool event
+        # carries a Symbol there, so we catch all of swap /
+        # provide_liquidity / withdraw_liquidity / donate / delegate ops.
+        # The circuit filters topic[0] down to the three we care about.
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow add --id {{.WORKFLOW_ID}}
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow trigger \
             --id {{.WORKFLOW_ID}} set-stellar \
-            --contract-id {{.BLENDED_POOL}} \
+            --contract-id "$BLENDED_POOL" \
             --chain {{.TRIGGER_CHAIN}} \
-            --topic rest-wildcard
+            --topic wildcard
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow component \
             --id {{.WORKFLOW_ID}} set-source-digest --digest "$CIRCUIT_DIGEST"
         warpdrive-cli service -f {{.SERVICE_FILE}} workflow submit \
@@ -246,17 +275,21 @@ tasks:
         set -euo pipefail
         : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
         : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
+        # Identity precedence (warpdrive-deployer 0.3.0-rc.1, identity.rs:
+        # resolve_secret): --secret → --secret-file → DEPLOYER_SECRET env →
+        # default keyfile. We use the env path so the secret never lands in
+        # docker argv / `docker inspect` output.
         docker run --rm \
-          --pull=always \
           --user "$(id -u):$(id -g)" \
           -e HOME=/tmp \
           -e RPC_URL="{{.RPC_URL}}" \
           -e NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
           -e DEPLOYER_SECRET="$DEPLOYER_SECRET" \
-          -e DEPLOYER_ADDRESS="$DEPLOYER_ADDRESS" \
           -v "$PWD/out:/out" \
           {{.MIDDLEWARE_IMAGE}} \
-          /warpdrive/cli.sh deploy --output-path /out/deploy.json --variant stellar
+          warpdrive-deployer deploy \
+            --output-path /out/deploy.json \
+            --variant stellar
 
   deploy-handler:
     desc: |
@@ -325,16 +358,14 @@ tasks:
         : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
         : "${SERVICE_URI:?SERVICE_URI is required}"
         docker run --rm \
-          --pull=always \
           --user "$(id -u):$(id -g)" \
           -e HOME=/tmp \
           -e RPC_URL="{{.RPC_URL}}" \
           -e NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
           -e DEPLOYER_SECRET="$DEPLOYER_SECRET" \
-          -e DEPLOYER_ADDRESS="$DEPLOYER_ADDRESS" \
           -v "$PWD/out:/out" \
           {{.MIDDLEWARE_IMAGE}} \
-          /warpdrive/cli.sh set-project-spec-repo \
+          warpdrive-deployer set-project-spec-repo \
             --repo "$SERVICE_URI" \
             --deploy-file /out/deploy.json
 
@@ -358,11 +389,30 @@ tasks:
         PROJECT_ROOT=$(jq -r .contracts.project_root out/deploy.json)
         BODY=$(jq -nc --arg chain "{{.MANAGER_CHAIN}}" --arg addr "$PROJECT_ROOT" \
             '{service_manager: {stellar: {chain: $chain, address: $addr}}}')
-        curl -sSf -X POST http://127.0.0.1:8000/services \
+        # Capture body + status separately so we can treat the "already
+        # registered" 500 as success. The dev `/dev/services/$HASH`
+        # activation already starts the manager-watch, making this call
+        # redundant when the service was loaded via the dev path. The
+        # node should arguably return 200 for the idempotent case, but
+        # it doesn't.
+        HTTP=$(curl -sS -X POST http://127.0.0.1:8000/services \
             -H "Content-Type: application/json" \
             --data "$BODY" \
-            -o /dev/null
-        echo "watching project_root $PROJECT_ROOT on {{.MANAGER_CHAIN}}"
+            -o /tmp/register-manager.body -w '%{http_code}')
+        case "$HTTP" in
+          2*) echo "watching project_root $PROJECT_ROOT on {{.MANAGER_CHAIN}}" ;;
+          5*)
+            BODY_TEXT=$(cat /tmp/register-manager.body 2>/dev/null || true)
+            if echo "$BODY_TEXT" | grep -qi "already registered"; then
+              echo "manager already registered (the dev service activation did it) — ok"
+            else
+              echo "register-manager failed ($HTTP):"
+              echo "$BODY_TEXT"
+              exit 1
+            fi
+            ;;
+          *) echo "register-manager unexpected response ($HTTP): $(cat /tmp/register-manager.body)"; exit 1 ;;
+        esac
 
   run-node:
     desc: |
@@ -403,17 +453,20 @@ tasks:
         set -euo pipefail
         : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
         : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
+        # deploy_pipeline rotates the ed25519-security admin to project_root
+        # at the end (deploy.rs:adopt_downstreams), so every post-deploy
+        # signer/threshold change MUST route through project_root's
+        # forwarder (--via-project-root); a direct call would fail auth.
         docker run --rm \
-          --pull=always \
           --user "$(id -u):$(id -g)" \
           -e HOME=/tmp \
           -e RPC_URL="{{.RPC_URL}}" \
           -e NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
           -e DEPLOYER_SECRET="$DEPLOYER_SECRET" \
-          -e DEPLOYER_ADDRESS="$DEPLOYER_ADDRESS" \
           -v "$PWD/out:/out" \
           {{.MIDDLEWARE_IMAGE}} \
-          /warpdrive/cli.sh set-threshold \
+          warpdrive-deployer set-threshold \
+            --via-project-root \
             --scheme ed25519 \
             --numerator {{.THRESHOLD_NUM}} \
             --denominator {{.THRESHOLD_DEN}} \
@@ -428,17 +481,18 @@ tasks:
         : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
         : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
         SIGNER_PUBKEY=$(cat out/signer.pubkey)
+        # --via-project-root: security admin was rotated to project_root by
+        # `deploy` (deploy.rs:adopt_downstreams). See `set-threshold` above.
         docker run --rm \
-          --pull=always \
           --user "$(id -u):$(id -g)" \
           -e HOME=/tmp \
           -e RPC_URL="{{.RPC_URL}}" \
           -e NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
           -e DEPLOYER_SECRET="$DEPLOYER_SECRET" \
-          -e DEPLOYER_ADDRESS="$DEPLOYER_ADDRESS" \
           -v "$PWD/out:/out" \
           {{.MIDDLEWARE_IMAGE}} \
-          /warpdrive/cli.sh add-signer \
+          warpdrive-deployer add-signer \
+            --via-project-root \
             --scheme ed25519 \
             --key "$SIGNER_PUBKEY" \
             --weight {{.SIGNER_WEIGHT}} \
@@ -511,7 +565,7 @@ tasks:
             --rpc-url "{{.RPC_URL}}" \
             --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
             --source "$POOL_ADMIN_SECRET" \
-            -- set_delegate --delegate "$HANDLER"
+            -- set_delegate --delegate "\"$HANDLER\""
         echo "delegate wired"
 
   unset-delegate:

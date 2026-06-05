@@ -28,7 +28,6 @@ version: '3'
 # Optional follow-ups (require funded testnet USDC + XLM in DEPLOYER_ADDRESS):
 #
 #   testnet:seed-pool             provide initial liquidity to the blended pool
-#   testnet:seed-blend             manual_to_blend a chunk of USDC into Blend
 #
 # Outputs land under ./out/testnet/. The handler stack writes to ./out/.
 #
@@ -68,7 +67,11 @@ vars:
 
   # Sibling repo
   PHOENIX_REPO: '{{.PHOENIX_REPO | default "../phoenix-contracts"}}'
-  PHOENIX_WASM_DIR: '{{.PHOENIX_REPO | default "../phoenix-contracts"}}/target/wasm32v1-none/release'
+  # phoenix-contracts is pinned to soroban-sdk 22.0.7, which still builds to
+  # wasm32-unknown-unknown. (soroban-sdk >= 22.0.8 switched the default to
+  # wasm32v1-none, which is what *this* repo's contracts use.) If the sibling
+  # repo bumps its SDK past 22.0.7, flip this to wasm32v1-none/release.
+  PHOENIX_WASM_DIR: '{{.PHOENIX_REPO | default "../phoenix-contracts"}}/target/wasm32-unknown-unknown/release'
 
   # Phoenix pool init defaults (i64 fields; Soroban-CLI accepts decimal literals)
   POOL_SWAP_FEE_BPS: '{{.POOL_SWAP_FEE_BPS | default "30"}}'
@@ -87,19 +90,24 @@ vars:
   # Handler policy. MIN_TOTAL_USDC is the floor of total pool USDC below
   # which Rebalance is a no-op; below this the handler refuses to touch
   # Blend. Mainnet default is 10000 USDC in the root Taskfile; testnet
-  # uses 1000 USDC so a 4.5k-USDC pool clears the floor with ~4.5x margin.
+  # uses 1000 USDC so a 1000-USDC pool sits exactly at the floor (the
+  # check is strict-less-than, so total == floor still rebalances).
   TARGET_RATIO_BPS: '{{.TARGET_RATIO_BPS | default "5000"}}'
   REBALANCE_BAND_BPS: '{{.REBALANCE_BAND_BPS | default "500"}}'
   MIN_TOTAL_USDC: '{{.MIN_TOTAL_USDC | default "10000000000"}}'
   REBALANCE_COOLDOWN_SECS: '{{.REBALANCE_COOLDOWN_SECS | default "60"}}'
 
-  # Liquidity seed defaults sized to a ~5k USDC + ~10k XLM deployer balance:
-  #   provide 4500 USDC + 9000 XLM to the pool, leaving ~500 USDC and
-  #   ~1000 XLM headroom for tx fees and re-runs. Half of the pool USDC
-  #   (2250 USDC) goes to Blend so the pool starts at exactly the 50% target.
-  XLM_SEED: '{{.XLM_SEED | default "90000000000"}}'
-  USDC_SEED: '{{.USDC_SEED | default "45000000000"}}'
-  BLEND_SEED_AMOUNT: '{{.BLEND_SEED_AMOUNT | default "22500000000"}}'
+  # WarpDrive chain keys. Override the root Taskfile defaults (which target
+  # mainnet) so both the manager and the rebalance trigger watch testnet —
+  # the only place the pool actually emits events during bring-up.
+  TRIGGER_CHAIN: '{{.TRIGGER_CHAIN | default "stellar:testnet"}}'
+  MANAGER_CHAIN: '{{.MANAGER_CHAIN | default "stellar:testnet"}}'
+
+  # Liquidity seed defaults sized for a 1k USDC + 10k XLM deployer: provide
+  # the full 1000 USDC + 2000 XLM to the pool. The pool starts 100% liquid;
+  # warpdrive's first Rebalance tick moves it to the configured target ratio.
+  XLM_SEED: '{{.XLM_SEED | default "20000000000"}}'
+  USDC_SEED: '{{.USDC_SEED | default "10000000000"}}'
 
 tasks:
   preflight:
@@ -152,7 +160,7 @@ tasks:
   check-balances:
     desc: |
       Print the deployer's XLM + USDC + BLND balances. Fast sanity check
-      before kicking off seed-pool / seed-blend. Fails with a clear error
+      before kicking off seed-pool. Fails with a clear error
       if XLM balance is too low to cover deploy fees or USDC balance is
       below USDC_SEED.
     cmds:
@@ -247,9 +255,21 @@ tasks:
         TOKEN_A="{{.USDC}}"
         TOKEN_B="{{.XLM}}"
 
-        # Soroban CLI accepts contracttype struct args as JSON. The pool
-        # constructor takes the LiquidityPoolInitInfo struct nested with
-        # TokenInitInfo + StakeInitInfo.
+        # Soroban CLI accepts contracttype struct args as JSON. Field-encoding
+        # rules (learned the hard way against stellar-cli 25.2.0):
+        #
+        #   Address       → JSON string ("G…" / "C…")           — --arg
+        #   i64 / u32     → bare JSON number                    — --argjson
+        #   i128 / u128   → JSON string (precision-safe)        — --arg
+        #
+        # Mixing them is mandatory: an i64 field given a string yields
+        # "unknown variant `<value>`" (the parser falls through to the
+        # ScSpecTypeDef enum), and an i128 given a bare number yields
+        # "invalid type: integer, expected string or map".
+        #
+        # Standalone scalar CLI flags (--default_slippage_bps,
+        # --max_allowed_fee_bps) are passed as quoted numerics — those
+        # go through a separate path that accepts either form.
         LP_INIT=$(jq -nc \
             --arg admin "$DEPLOYER_ADDRESS" \
             --arg fee_recipient "$DEPLOYER_ADDRESS" \
@@ -261,8 +281,8 @@ tasks:
             --argjson default_slippage_bps {{.POOL_DEFAULT_SLIPPAGE_BPS}} \
             --argjson max_allowed_spread_bps {{.POOL_MAX_SPREAD_BPS}} \
             --argjson max_referral_bps {{.POOL_MAX_REFERRAL_BPS}} \
-            --argjson min_bond {{.STAKE_MIN_BOND}} \
-            --argjson min_reward {{.STAKE_MIN_REWARD}} \
+            --arg min_bond "{{.STAKE_MIN_BOND}}" \
+            --arg min_reward "{{.STAKE_MIN_REWARD}}" \
             --argjson max_complexity {{.STAKE_MAX_COMPLEXITY}} \
             '{
               admin: $admin,
@@ -395,12 +415,75 @@ tasks:
         NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
         task -t Taskfile.yml verify-deploy
 
+  redeploy-handler-only:
+    desc: |
+      Rebuild + redeploy ONLY the automation-handler against the existing
+      middleware (security / verification / project_root in
+      out/deploy.json). Use this when the handler's wasm changes but the
+      ed25519 pipeline is unchanged — avoids invalidating the signer
+      registration and the project_root address that the operator + the
+      service.json's manager are already bound to.
+
+      Steps performed:
+        1. build-handler (rebuild wasm)
+        2. deploy-handler with full testnet env (writes new out/handler.json)
+        3. set-delegate (rewires pool to the new handler address)
+        4. build-service (regenerates service.json with new handler addr,
+           reusing existing CIRCUIT_DIGEST + AGG_DIGEST under out/)
+
+      After this task: run `task publish-service` to pin + register the new
+      IPFS URI on project_root, and `task testnet:make-frontend-config`
+      (+ optionally `task vps:deploy-frontend`) to refresh the dashboard
+      config. The operator on the VPS picks up the new spec on its next
+      poll cycle.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
+        : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
+        test -f out/deploy.json \
+          || { echo "out/deploy.json missing — middleware never deployed; run testnet:deploy-handler-stack instead"; exit 1; }
+        test -f out/testnet/pool.json \
+          || { echo "out/testnet/pool.json missing — pool never deployed; run testnet:full or testnet:deploy-phoenix-pool first"; exit 1; }
+        test -f out/testnet/blend-reserves.json \
+          || { echo "out/testnet/blend-reserves.json missing — run testnet:lookup-usdc-reserve first"; exit 1; }
+        BLENDED_POOL=$(jq -r .blended_pool out/testnet/pool.json)
+        USDC_RESERVE_TOKEN_ID=$(jq -r .usdc_reserve_token_id out/testnet/blend-reserves.json)
+        BLND_TREASURY="${BLND_TREASURY:-$DEPLOYER_ADDRESS}"
+
+        BLENDED_POOL="$BLENDED_POOL" \
+        BLEND_POOL="{{.BLEND_POOL}}" \
+        USDC="{{.USDC}}" \
+        XLM="{{.XLM}}" \
+        BLND_TREASURY="$BLND_TREASURY" \
+        USDC_RESERVE_TOKEN_ID="$USDC_RESERVE_TOKEN_ID" \
+        TARGET_RATIO_BPS="{{.TARGET_RATIO_BPS}}" \
+        REBALANCE_BAND_BPS="{{.REBALANCE_BAND_BPS}}" \
+        MIN_TOTAL_USDC="{{.MIN_TOTAL_USDC}}" \
+        REBALANCE_COOLDOWN_SECS="{{.REBALANCE_COOLDOWN_SECS}}" \
+        HANDLER_ADMIN="$DEPLOYER_ADDRESS" \
+        RPC_URL="{{.RPC_URL}}" \
+        NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
+        task -t Taskfile.yml deploy-handler
+
+        BLENDED_POOL="$BLENDED_POOL" \
+        RPC_URL="{{.RPC_URL}}" \
+        NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
+        task -t Taskfile.yml set-delegate
+
+        BLENDED_POOL="$BLENDED_POOL" \
+        task -t Taskfile.yml build-service
+
+        echo
+        echo "handler redeployed: $(jq -r .automation_handler out/handler.json)"
+        echo "service.json rebuilt. Run \`task publish-service\` to pin + register."
+
   full:
     desc: |
       End-to-end testnet bring-up: fund (XLM via friendbot) → check balances
       → phoenix wasms → phoenix pool deploy → Blend USDC reserve lookup →
       handler stack → set-delegate → verify. Does NOT seed liquidity by
-      default — run testnet:seed-pool + testnet:seed-blend after this if
+      default — run testnet:seed-pool after this if
       your deployer has USDC.
     cmds:
       - task: preflight
@@ -430,10 +513,54 @@ tasks:
         echo "Next steps:"
         echo "  1. Fund deployer with testnet XLM + USDC if not already."
         echo "  2. task testnet:seed-pool      # add initial liquidity"
-        echo "  3. task testnet:seed-blend     # push half of USDC into Blend"
-        echo "  4. task run-node               # start operator node"
-        echo "  5. task wire-service           # register the WarpDrive service"
+        echo "  3. task run-node               # start operator node"
+        echo "  4. task wire-service           # register the WarpDrive service"
         echo "=========================================="
+
+  make-frontend-config:
+    desc: |
+      Generate frontend/config.json from out/handler.json +
+      out/testnet/pool.json + $DEPLOYER_ADDRESS, so the dashboard works
+      without any hand-editing. Safe to re-run after a redeploy — it
+      overwrites the existing config.json.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
+        HANDLER=$(jq -r .automation_handler out/handler.json)
+        POOL=$(jq -r .blended_pool out/testnet/pool.json)
+        test -n "$HANDLER" -a "$HANDLER" != "null" || { echo "out/handler.json missing automation_handler"; exit 1; }
+        test -n "$POOL"    -a "$POOL"    != "null" || { echo "out/testnet/pool.json missing blended_pool"; exit 1; }
+        jq -n \
+          --arg rpc_url            "{{.RPC_URL}}" \
+          --arg horizon_url        "https://horizon-testnet.stellar.org" \
+          --arg network_passphrase "{{.NETWORK_PASSPHRASE}}" \
+          --arg handler_id         "$HANDLER" \
+          --arg blended_pool_id    "$POOL" \
+          --arg blend_pool_id      "{{.BLEND_POOL}}" \
+          --arg usdc_id            "{{.USDC}}" \
+          --arg xlm_id             "{{.XLM}}" \
+          --arg blnd_id            "{{.BLND}}" \
+          --arg source_account     "$DEPLOYER_ADDRESS" \
+          --arg deployer_address   "$DEPLOYER_ADDRESS" \
+          --arg stellar_expert     "https://stellar.expert/explorer/testnet" \
+          '{ rpc_url: $rpc_url,
+             horizon_url: $horizon_url,
+             network_passphrase: $network_passphrase,
+             handler_id: $handler_id,
+             blended_pool_id: $blended_pool_id,
+             blend_pool_id: $blend_pool_id,
+             usdc_id: $usdc_id,
+             xlm_id: $xlm_id,
+             blnd_id: $blnd_id,
+             source_account: $source_account,
+             deployer_address: $deployer_address,
+             refresh_interval_ms: 10000,
+             event_lookback_ledgers: 17280,
+             stellar_expert_base: $stellar_expert }' \
+          > frontend/config.json
+        echo "wrote frontend/config.json:"
+        jq . frontend/config.json
 
   # --- Optional follow-ups (require funded deployer) -------------------------
 
@@ -458,7 +585,7 @@ tasks:
             --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
             --source "$DEPLOYER_SECRET" \
             -- provide_liquidity \
-              --depositor "$DEPLOYER_ADDRESS" \
+              --sender "$DEPLOYER_ADDRESS" \
               --desired_a "{{.USDC_SEED}}" \
               --min_a "{{.USDC_SEED}}" \
               --desired_b "{{.XLM_SEED}}" \
@@ -466,18 +593,6 @@ tasks:
               --auto_stake false
         echo "pool seeded"
 
-  seed-blend:
-    desc: |
-      Push BLEND_SEED_AMOUNT USDC from the pool into Blend via admin
-      manual_to_blend. Default seeds half of USDC_SEED into Blend so the
-      pool starts at the 50% target.
-    cmds:
-      - |
-        set -euo pipefail
-        AMOUNT="{{.BLEND_SEED_AMOUNT}}" \
-        RPC_URL="{{.RPC_URL}}" \
-        NETWORK_PASSPHRASE="{{.NETWORK_PASSPHRASE}}" \
-        task -t Taskfile.yml manual-to-blend
 
   # --- Inspection / debug helpers -------------------------------------------
 

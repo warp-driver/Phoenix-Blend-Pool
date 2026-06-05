@@ -1,0 +1,438 @@
+version: '3'
+
+# Single-operator VPS deploy for the phoenix-blend WarpDrive node.
+#
+# Project-scoped to coexist with other WarpDrive deploys on the same host
+# (e.g. the legacy hodlers-app operator on 8000/9000). This operator's
+# resources live under distinct names everywhere:
+#
+#   systemd unit          phoenix-blend-node.service
+#   binary                /opt/phoenix-blend-pool/bin/warpdrive
+#   env file              /etc/default/phoenix-blend-node
+#   data dir              /var/lib/phoenix-blend-node
+#   HTTP API port         8010   (legacy is 8000)
+#   libp2p port           9010   (legacy is 9000)
+#   dashboard unit        phoenix-blend-display.service
+#   dashboard port        8082   (bound to 0.0.0.0; opened on the VPS firewall)
+#
+# The shared `warpdrive` system user is safe: each systemd unit is
+# ReadOnlyPaths-confined to its own dirs.
+#
+# Topology with the operator running on a VPS:
+#
+#   laptop                                      VPS
+#   ────────────────────────────────────────────────────────────────────
+#   task wire-service ─► curl localhost:8000 ─SSH-L─► 127.0.0.1:8010
+#                                                            │
+#                                                            ▼
+#                                                   /opt/phoenix-blend-pool/bin/warpdrive
+#                                                          (systemd)
+#                                                            │
+#                                                            ▼
+#                                                      Stellar RPC
+#                                                   (egress only)
+#
+# Required env vars on your laptop:
+#   VPS_HOST=<user@host or ~/.ssh/config alias>
+#
+# Optional overrides:
+#   VPS_DIR=/opt/phoenix-blend-pool        deploy dir on the VPS
+#   VPS_NODE_PORT=8010                     remote port the node binds to
+#   VPS_NODE_LOCAL_PORT=8000               local port the tunnel forwards FROM
+#                                          (keep at 8000 so existing wire-service
+#                                          tasks hit localhost:8000 unchanged)
+#   VPS_DASHBOARD_PORT=8082                remote port the dashboard binds to
+#   VPS_DASHBOARD_LOCAL_PORT=8081          local port the dashboard tunnel forwards FROM
+#   WARPDRIVE_REPO=../warpdrive            path to the patched warpdrive fork
+#   BUILD_TARGET=                          set to `musl` for static binaries
+#
+# Run sequence:
+#
+#   export VPS_HOST="hodlers-op-3"   # or whatever your SSH alias is
+#   task vps:provision               # one-shot: deps + systemd unit + locally-built binary
+#   task vps:edit-env                # fill /etc/default/phoenix-blend-node (tty-safe)
+#   task vps:deploy                  # ships warpdrive.toml + starts the service
+#   task vps:status                  # confirm "active (running)"
+#
+#   # Side terminal — keep open while wiring:
+#   task vps:tunnel                  # ssh -L 8000:127.0.0.1:8010
+#
+#   # Main terminal — these existing tasks now reach the VPS via the tunnel:
+#   task wire-service
+#   task register-manager
+#   task fetch-signer
+#   task register-signer
+#
+#   # Drop the tunnel when done; the node keeps running on the VPS.
+
+vars:
+  VPS_HOST:                  '{{.VPS_HOST | default ""}}'
+  VPS_DIR:                   '{{.VPS_DIR | default "/opt/phoenix-blend-pool"}}'
+  VPS_NODE_PORT:             '{{.VPS_NODE_PORT | default "8010"}}'
+  VPS_NODE_LOCAL_PORT:       '{{.VPS_NODE_LOCAL_PORT | default "8000"}}'
+  VPS_DASHBOARD_PORT:        '{{.VPS_DASHBOARD_PORT | default "8082"}}'
+  VPS_DASHBOARD_LOCAL_PORT:  '{{.VPS_DASHBOARD_LOCAL_PORT | default "8081"}}'
+  WARPDRIVE_REPO:            '{{.WARPDRIVE_REPO | default "../warpdrive"}}'
+  WD_PKG:                    '{{.WD_PKG | default "packages/warpdrive"}}'
+  BUILD_TARGET:              '{{.BUILD_TARGET | default ""}}'
+
+tasks:
+  preflight:
+    desc: Verify VPS_HOST is set and SSH works in batch mode.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${VPS_HOST:?Set VPS_HOST to user@host or an ~/.ssh/config alias.}"
+        ssh -o BatchMode=yes -o ConnectTimeout=10 "$VPS_HOST" true \
+          || { echo "ssh $VPS_HOST failed — verify key auth and DNS"; exit 1; }
+        echo "ssh ok: $VPS_HOST"
+        test -d "{{.WARPDRIVE_REPO}}" \
+          || { echo "WARPDRIVE_REPO not found at {{.WARPDRIVE_REPO}}"; exit 1; }
+        test -f systemd/phoenix-blend-node.service \
+          || { echo "systemd unit missing"; exit 1; }
+
+  provision:
+    desc: |
+      One-shot VPS setup. Installs minimal runtime deps, creates the
+      warpdrive user + data dir, installs the systemd unit + env
+      template, and copies the locally-built warpdrive binary. Compiles
+      LOCALLY (not on the VPS) so a 2 GB VPS works fine. Idempotent.
+      Coexists with other WarpDrive deploys on the host — uses
+      project-scoped names everywhere.
+    deps: [preflight]
+    cmds:
+      - task: install-os-deps
+      - task: build-warpdrive
+      - task: ship-warpdrive
+      - task: ship-systemd
+      - echo
+      - echo "VPS provisioned. Next step:"
+      - echo "  task vps:edit-env"
+      - echo "and fill WARPDRIVE_SIGNING_MNEMONIC + DEPLOYER_SECRET."
+
+  install-os-deps:
+    desc: |
+      Install ONLY the runtime deps warpdrive needs on the VPS: TLS roots,
+      jq + rsync for sysadmin scripts, python3 for the optional static
+      dashboard. No build toolchain, no rustup — compilation is local.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${VPS_HOST:?}"
+        ssh "$VPS_HOST" 'bash -se' <<'REMOTE'
+        set -euo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        sudo apt-get update
+        sudo apt-get install -y ca-certificates jq rsync python3
+        REMOTE
+
+  build-warpdrive:
+    desc: |
+      Build the patched warpdrive binary LOCALLY. Default target: native
+      release glibc build. For portability across distros pass
+      BUILD_TARGET=musl (needs `rustup target add x86_64-unknown-linux-musl`
+      + musl-tools / musl-gcc installed locally).
+    cmds:
+      - |
+        set -euo pipefail
+        if [ "{{.BUILD_TARGET}}" = "musl" ]; then
+          rustup target add x86_64-unknown-linux-musl 2>/dev/null || true
+          cd "{{.WARPDRIVE_REPO}}" \
+            && cargo build --release --target x86_64-unknown-linux-musl \
+                 --manifest-path "{{.WD_PKG}}/Cargo.toml"
+          BIN="$PWD/target/x86_64-unknown-linux-musl/release/warpdrive"
+        else
+          cd "{{.WARPDRIVE_REPO}}" \
+            && cargo build --release \
+                 --manifest-path "{{.WD_PKG}}/Cargo.toml"
+          BIN="$PWD/target/release/warpdrive"
+        fi
+        test -x "$BIN" || { echo "warpdrive binary not found at $BIN"; exit 1; }
+        ls -lh "$BIN"
+        file "$BIN" 2>/dev/null || true
+
+  ship-warpdrive:
+    desc: |
+      Copy the locally-built warpdrive binary to
+      /opt/phoenix-blend-pool/bin/warpdrive on the VPS (project-scoped
+      path; does NOT clobber /usr/local/bin/warpdrive which a legacy
+      operator may rely on). Run `task vps:build-warpdrive` first.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${VPS_HOST:?}"
+        if [ "{{.BUILD_TARGET}}" = "musl" ]; then
+          BIN="{{.WARPDRIVE_REPO}}/target/x86_64-unknown-linux-musl/release/warpdrive"
+        else
+          BIN="{{.WARPDRIVE_REPO}}/target/release/warpdrive"
+        fi
+        test -x "$BIN" \
+          || { echo "warpdrive binary missing at $BIN — run 'task vps:build-warpdrive' first"; exit 1; }
+        SIZE=$(stat -c %s "$BIN" 2>/dev/null || wc -c < "$BIN")
+        echo "shipping $BIN ($((SIZE/1024/1024)) MiB)"
+        scp "$BIN" "$VPS_HOST:/tmp/phoenix-blend-warpdrive.new"
+        ssh "$VPS_HOST" 'bash -se' <<REMOTE
+        set -euo pipefail
+        sudo install -d -o warpdrive -g warpdrive -m 0755 {{.VPS_DIR}}/bin
+        sudo install -o root -g root -m 0755 /tmp/phoenix-blend-warpdrive.new {{.VPS_DIR}}/bin/warpdrive
+        rm -f /tmp/phoenix-blend-warpdrive.new
+        {{.VPS_DIR}}/bin/warpdrive --help 2>&1 | head -1 || true
+        REMOTE
+
+  ship-systemd:
+    desc: |
+      Install /etc/systemd/system/phoenix-blend-node.service +
+      /etc/default/phoenix-blend-node (only if the env file doesn't
+      exist; populated versions are NOT overwritten). Creates the
+      warpdrive system user (shared safely with other WarpDrive
+      operators) and the project-scoped data dir.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${VPS_HOST:?}"
+        scp systemd/phoenix-blend-node.service     "$VPS_HOST:/tmp/phoenix-blend-node.service"
+        scp systemd/phoenix-blend-node.env.example "$VPS_HOST:/tmp/phoenix-blend-node.env.example"
+        ssh "$VPS_HOST" 'bash -se' <<REMOTE
+        set -euo pipefail
+        if ! id warpdrive >/dev/null 2>&1; then
+          sudo useradd --system --create-home --home-dir /var/lib/warpdrive --shell /bin/bash warpdrive
+        fi
+        sudo install -d -o warpdrive -g warpdrive -m 0750 /var/lib/phoenix-blend-node
+        sudo install -d -o warpdrive -g warpdrive -m 0755 {{.VPS_DIR}}
+        sudo install -d -o warpdrive -g warpdrive -m 0755 {{.VPS_DIR}}/out
+        sudo install -o root -g root -m 0644 /tmp/phoenix-blend-node.service /etc/systemd/system/phoenix-blend-node.service
+        if [ ! -f /etc/default/phoenix-blend-node ]; then
+          sudo install -o root -g root -m 0600 /tmp/phoenix-blend-node.env.example /etc/default/phoenix-blend-node
+          echo "installed /etc/default/phoenix-blend-node from template"
+          echo "edit it (sudo) to set WARPDRIVE_SIGNING_MNEMONIC + DEPLOYER_SECRET"
+        else
+          echo "/etc/default/phoenix-blend-node already populated; left untouched"
+        fi
+        rm -f /tmp/phoenix-blend-node.service /tmp/phoenix-blend-node.env.example
+        sudo systemctl daemon-reload
+        sudo systemctl enable phoenix-blend-node
+        REMOTE
+
+  deploy:
+    desc: |
+      rsync warpdrive.toml to the VPS deploy directory and restart the
+      node. Self-healing: creates the dir if missing (e.g. provision
+      was skipped or partial).
+    deps: [preflight]
+    cmds:
+      - |
+        set -euo pipefail
+        : "${VPS_HOST:?}"
+        ssh "$VPS_HOST" "sudo install -d -o warpdrive -g warpdrive -m 0755 {{.VPS_DIR}}"
+        rsync -av warpdrive.toml "$VPS_HOST:{{.VPS_DIR}}/warpdrive.toml"
+        ssh "$VPS_HOST" "sudo chown warpdrive:warpdrive {{.VPS_DIR}}/warpdrive.toml"
+        if ssh "$VPS_HOST" "test -f /etc/systemd/system/phoenix-blend-node.service"; then
+          ssh "$VPS_HOST" 'sudo systemctl restart phoenix-blend-node'
+          sleep 3
+          ssh "$VPS_HOST" 'sudo systemctl is-active phoenix-blend-node --quiet && echo "phoenix-blend-node: active" || (echo "phoenix-blend-node failed to start"; sudo journalctl -u phoenix-blend-node -n 30 --no-pager; exit 1)'
+        else
+          echo "phoenix-blend-node.service not installed — run 'task vps:provision' first"
+          exit 1
+        fi
+
+  start:
+    desc: systemctl start phoenix-blend-node on the VPS.
+    cmds:
+      - ssh "$VPS_HOST" 'sudo systemctl start phoenix-blend-node'
+
+  stop:
+    desc: systemctl stop phoenix-blend-node on the VPS.
+    cmds:
+      - ssh "$VPS_HOST" 'sudo systemctl stop phoenix-blend-node'
+
+  restart:
+    desc: systemctl restart phoenix-blend-node on the VPS.
+    cmds:
+      - ssh "$VPS_HOST" 'sudo systemctl restart phoenix-blend-node'
+
+  status:
+    desc: systemctl status + recent journalctl for the phoenix-blend operator.
+    cmds:
+      - ssh "$VPS_HOST" 'sudo systemctl status phoenix-blend-node --no-pager -l | head -30'
+      - echo
+      - ssh "$VPS_HOST" 'sudo journalctl -u phoenix-blend-node -n 30 --no-pager'
+
+  logs:
+    desc: Tail VPS logs for the phoenix-blend operator (Ctrl-C to exit).
+    cmds:
+      - ssh "$VPS_HOST" 'sudo journalctl -u phoenix-blend-node -f --no-pager'
+
+  edit-env:
+    desc: |
+      Open /etc/default/phoenix-blend-node in nano on the VPS with a
+      proper pseudo-tty. Use EDITOR env to pick a different editor.
+    vars:
+      REMOTE_EDITOR: '{{.EDITOR | default "nano"}}'
+    cmds:
+      - ssh -t "$VPS_HOST" "sudo {{.REMOTE_EDITOR}} /etc/default/phoenix-blend-node"
+
+  install-env:
+    desc: |
+      Build /etc/default/phoenix-blend-node on the VPS from local env
+      vars and scp it over (mode 0600). Useful as a non-interactive
+      alternative to `task vps:edit-env` when you already have the
+      mnemonic + S-key in your shell.
+
+      Required env on your laptop:
+        WARPDRIVE_SIGNING_MNEMONIC   24-word BIP39 phrase (quoted)
+        DEPLOYER_SECRET             Stellar S-key
+      Optional:
+        WARPDRIVE_AGGREGATOR_STELLAR_CREDENTIAL   defaults to DEPLOYER_SECRET
+        OVERWRITE=1                              clobber an existing populated env file
+
+      Convenience: if MNEMONIC_FILE is set, the mnemonic is read from
+      that file instead of WARPDRIVE_SIGNING_MNEMONIC (useful if you
+      keep it in ~/.phoenix-blend-mnemonic).
+    cmds:
+      - |
+        set -euo pipefail
+        : "${VPS_HOST:?}"
+        : "${DEPLOYER_SECRET:?DEPLOYER_SECRET must be set in your shell}"
+        if [ -n "${MNEMONIC_FILE:-}" ]; then
+          test -f "$MNEMONIC_FILE" || { echo "MNEMONIC_FILE ($MNEMONIC_FILE) not found"; exit 1; }
+          WARPDRIVE_SIGNING_MNEMONIC="$(cat "$MNEMONIC_FILE")"
+        fi
+        : "${WARPDRIVE_SIGNING_MNEMONIC:?WARPDRIVE_SIGNING_MNEMONIC (or MNEMONIC_FILE) must be set}"
+        AGG_CRED="${WARPDRIVE_AGGREGATOR_STELLAR_CREDENTIAL:-}"
+        # Build the file locally first so we never expose the values in
+        # remote `ps` output or shell history. Restrictive umask + 0600.
+        TMPFILE=$(mktemp)
+        trap 'rm -f "$TMPFILE"' EXIT
+        chmod 600 "$TMPFILE"
+        {
+          echo "# /etc/default/phoenix-blend-node — generated by task vps:install-env"
+          printf 'WARPDRIVE_SIGNING_MNEMONIC=%q\n' "$WARPDRIVE_SIGNING_MNEMONIC"
+          # The aggregator subsystem reads WARPDRIVE_AGGREGATOR_STELLAR_CREDENTIAL.
+          # DEPLOYER_SECRET is a laptop-side Taskfile alias and is NOT recognised
+          # by the warpdrive binary, so we explicitly map one to the other here.
+          printf 'WARPDRIVE_AGGREGATOR_STELLAR_CREDENTIAL=%q\n' "${AGG_CRED:-$DEPLOYER_SECRET}"
+        } > "$TMPFILE"
+        # Refuse to overwrite a populated file unless OVERWRITE=1.
+        if [ "${OVERWRITE:-0}" != "1" ]; then
+          if ssh "$VPS_HOST" 'sudo test -s /etc/default/phoenix-blend-node && ! sudo grep -q "word word word" /etc/default/phoenix-blend-node'; then
+            echo "/etc/default/phoenix-blend-node already populated — refusing to overwrite."
+            echo "Pass OVERWRITE=1 to clobber, or run 'task vps:edit-env' to merge by hand."
+            exit 1
+          fi
+        fi
+        scp -p "$TMPFILE" "$VPS_HOST:/tmp/phoenix-blend-node.env.new"
+        ssh "$VPS_HOST" 'bash -se' <<'REMOTE'
+        set -euo pipefail
+        sudo install -o root -g root -m 0600 /tmp/phoenix-blend-node.env.new /etc/default/phoenix-blend-node
+        rm -f /tmp/phoenix-blend-node.env.new
+        echo "/etc/default/phoenix-blend-node installed (mode 0600)"
+        REMOTE
+  tunnel:
+    desc: |
+      SSH local-forward `localhost:{{.VPS_NODE_LOCAL_PORT}}` →
+      VPS `127.0.0.1:{{.VPS_NODE_PORT}}` so the existing wire-service /
+      fetch-signer / register-signer tasks (which hit
+      http://127.0.0.1:8000 unchanged) transparently reach the
+      phoenix-blend node. Foreground; Ctrl-C to close.
+    cmds:
+      - echo "tunneling localhost:{{.VPS_NODE_LOCAL_PORT}} ⇄ $VPS_HOST:{{.VPS_NODE_PORT}} (Ctrl-C to stop)"
+      - ssh -N -L "{{.VPS_NODE_LOCAL_PORT}}:127.0.0.1:{{.VPS_NODE_PORT}}" "$VPS_HOST"
+
+  install-frontend:
+    desc: |
+      One-shot VPS setup for the dashboard. Creates /srv/phoenix-blend-display,
+      installs the project-scoped systemd unit, enables but doesn't start
+      it. Safe alongside other static-server units on the same host.
+    deps: [preflight]
+    cmds:
+      - |
+        set -euo pipefail
+        : "${VPS_HOST:?}"
+        scp systemd/phoenix-blend-display.service "$VPS_HOST:/tmp/phoenix-blend-display.service"
+        ssh "$VPS_HOST" 'bash -se' <<'REMOTE'
+        set -euo pipefail
+        sudo install -d -o warpdrive -g warpdrive -m 0755 /srv/phoenix-blend-display
+        sudo install -o root -g root -m 0644 /tmp/phoenix-blend-display.service \
+            /etc/systemd/system/phoenix-blend-display.service
+        rm -f /tmp/phoenix-blend-display.service
+        sudo systemctl daemon-reload
+        sudo systemctl enable phoenix-blend-display
+        echo "phoenix-blend-display unit installed; not started yet"
+        REMOTE
+
+  deploy-frontend:
+    desc: |
+      Sync frontend/ (with frontend/config.json) to /srv/phoenix-blend-display
+      on the VPS and restart the static server. Run
+      `task testnet:make-frontend-config` first.
+    deps: [preflight]
+    cmds:
+      - |
+        set -euo pipefail
+        : "${VPS_HOST:?}"
+        test -f frontend/config.json \
+          || { echo "frontend/config.json missing — run 'task testnet:make-frontend-config' first"; exit 1; }
+        rsync -av --delete frontend/ "$VPS_HOST:/tmp/phoenix-blend-display/"
+        ssh "$VPS_HOST" 'bash -se' <<'REMOTE'
+        set -euo pipefail
+        sudo rsync -a --delete --chown=warpdrive:warpdrive /tmp/phoenix-blend-display/ /srv/phoenix-blend-display/
+        rm -rf /tmp/phoenix-blend-display
+        sudo systemctl restart phoenix-blend-display
+        sleep 1
+        if sudo systemctl is-active phoenix-blend-display --quiet; then
+          echo "phoenix-blend-display: active on 0.0.0.0:8082"
+        else
+          echo "phoenix-blend-display failed to start"
+          sudo journalctl -u phoenix-blend-display -n 30 --no-pager
+          exit 1
+        fi
+        REMOTE
+
+  tunnel-dashboard:
+    desc: |
+      SSH local-forward localhost:{{.VPS_DASHBOARD_LOCAL_PORT}} →
+      VPS 127.0.0.1:{{.VPS_DASHBOARD_PORT}}. Open
+      http://localhost:{{.VPS_DASHBOARD_LOCAL_PORT}} while it's up.
+      Foreground; Ctrl-C to close.
+    cmds:
+      - echo "tunneling localhost:{{.VPS_DASHBOARD_LOCAL_PORT}} ⇄ $VPS_HOST:{{.VPS_DASHBOARD_PORT}} — open http://localhost:{{.VPS_DASHBOARD_LOCAL_PORT}}"
+      - ssh -N -L "{{.VPS_DASHBOARD_LOCAL_PORT}}:127.0.0.1:{{.VPS_DASHBOARD_PORT}}" "$VPS_HOST"
+
+  dashboard:
+    desc: |
+      One-liner: regenerate frontend/config.json from local out/ artefacts,
+      deploy to the VPS, then open the SSH tunnel.
+    cmds:
+      - task: :testnet:make-frontend-config
+      - task: deploy-frontend
+      - task: tunnel-dashboard
+
+  ssh:
+    desc: Drop into an interactive shell on the VPS.
+    cmds:
+      - ssh "$VPS_HOST"
+
+  full:
+    desc: |
+      End-to-end VPS bring-up. Use this AFTER `task testnet:full` (so the
+      contracts are deployed) and AFTER editing /etc/default/phoenix-blend-node
+      with real secrets. Runs: preflight → provision → deploy → status.
+    cmds:
+      - task: preflight
+      - task: provision
+      - |
+        echo
+        echo "=========================================="
+        echo "Now edit secrets on the VPS:"
+        echo "  task vps:edit-env"
+        echo
+        echo "When ready, finish the bring-up with:"
+        echo "  task vps:deploy"
+        echo "  task vps:status"
+        echo
+        echo "Then in a side terminal:   task vps:tunnel"
+        echo "And in your main shell:    task wire-service"
+        echo "                           task register-manager"
+        echo "                           task fetch-signer"
+        echo "                           task register-signer"
+        echo "=========================================="
