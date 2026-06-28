@@ -51,6 +51,9 @@ includes:
   testnet:
     taskfile: ./taskfiles/testnet.yml
     optional: false
+  mainnet:
+    taskfile: ./taskfiles/mainnet.yml
+    optional: false
   vps:
     taskfile: ./taskfiles/vps.yml
     optional: false
