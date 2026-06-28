@@ -123,6 +123,12 @@ impl AutomationHandler {
             "rebalance_band_bps must be < 10000"
         );
         assert!(min_total_usdc >= 0, "min_total_usdc must be non-negative");
+        if usdc_reserve_token_id % 2 == 0 {
+            soroban_sdk::panic_with_error!(
+                &env,
+                crate::error::LocalError::InvalidReserveTokenId
+            );
+        }
 
         storage::set_admin(&env, &admin);
         storage::set_verification_contract(&env, &verification_contract);
@@ -540,6 +546,12 @@ impl AutomationHandler {
     /// reserve set or the handler is repointed at a new Blend pool.
     pub fn set_usdc_reserve_token_id(env: Env, id: u32) {
         storage::get_admin(&env).require_auth();
+        if id % 2 == 0 {
+            soroban_sdk::panic_with_error!(
+                &env,
+                crate::error::LocalError::InvalidReserveTokenId
+            );
+        }
         storage::set_usdc_reserve_token_id(&env, id);
         ConfigUpdated::new(soroban_sdk::symbol_short!("usdc_id"), id as i128).publish(&env);
         storage::extend_instance_ttl(&env);

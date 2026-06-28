@@ -23,4 +23,10 @@ pub enum LocalError {
     /// action completed. Indicates a code bug that would otherwise leak
     /// funds; reverts the tx so the previous-state invariant is preserved.
     UsdcLeak = 601,
+
+    /// `usdc_reserve_token_id` set to an even value. Blend's emissions
+    /// distributor branches on parity (`% 2 == 1` is the supplier-side
+    /// b-token, `% 2 == 0` is the liability d-token); a wrong parity
+    /// silently claims zero BLND for the supplier role forever.
+    InvalidReserveTokenId = 602,
 }
