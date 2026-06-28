@@ -250,11 +250,26 @@ tasks:
         set -euo pipefail
         : "${DEPLOYER_SECRET:?}"
         : "${DEPLOYER_ADDRESS:?}"
+        # Pool admin gates set_delegate / propose_admin / set_*. On mainnet
+        # the deployer hot key must not double as pool admin — a stolen
+        # deployer key could re-delegate the pool USDC to an attacker
+        # handler. Require POOL_ADMIN explicitly, and refuse a G-strkey
+        # so rotation has to go through a Soroban contract (multisig).
+        if [ "{{.NETWORK_PASSPHRASE}}" = "Public Global Stellar Network ; September 2015" ]; then
+          if [ -z "${POOL_ADMIN:-}" ]; then
+            echo "POOL_ADMIN is required for mainnet pool deploy (refuse to collapse onto DEPLOYER_ADDRESS)" >&2
+            exit 1
+          fi
+          case "$POOL_ADMIN" in
+            C*) ;;
+            *) echo "POOL_ADMIN must be a contract (C-strkey, e.g. multisig); got '$POOL_ADMIN'" >&2; exit 1;;
+          esac
+        fi
+        POOL_ADMIN_ADDR="${POOL_ADMIN:-$DEPLOYER_ADDRESS}"
         STAKE_HASH=$(jq -r .stake_wasm_hash out/testnet/phoenix-wasms.json)
         TOKEN_HASH=$(jq -r .token_wasm_hash out/testnet/phoenix-wasms.json)
         TOKEN_A="{{.USDC}}"
         TOKEN_B="{{.XLM}}"
-
         # Soroban CLI accepts contracttype struct args as JSON. Field-encoding
         # rules (learned the hard way against stellar-cli 25.2.0):
         #
@@ -271,9 +286,9 @@ tasks:
         # --max_allowed_fee_bps) are passed as quoted numerics — those
         # go through a separate path that accepts either form.
         LP_INIT=$(jq -nc \
-            --arg admin "$DEPLOYER_ADDRESS" \
-            --arg fee_recipient "$DEPLOYER_ADDRESS" \
-            --arg manager "$DEPLOYER_ADDRESS" \
+            --arg admin "$POOL_ADMIN_ADDR" \
+            --arg fee_recipient "${POOL_FEE_RECIPIENT:-$POOL_ADMIN_ADDR}" \
+            --arg manager "${POOL_MANAGER:-$POOL_ADMIN_ADDR}" \
             --arg token_a "$TOKEN_A" \
             --arg token_b "$TOKEN_B" \
             --argjson swap_fee_bps {{.POOL_SWAP_FEE_BPS}} \
