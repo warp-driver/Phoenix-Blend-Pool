@@ -1304,10 +1304,25 @@ fn last_harvest_ts_defaults_to_zero() {
 }
 
 #[test]
-fn harvest_updates_last_harvest_ts() {
+fn harvest_updates_last_harvest_ts_when_work_done() {
     let h = setup();
+    // Seed a BLND emission so the harvest actually moves something; under
+    // the no-op contract last_harvest_ts is only stamped when blnd_routed
+    // or interest_donated is non-zero.
+    let claim: i128 = 100_000_000;
+    h.blnd_admin.mint(&h.mock_blend_id, &claim);
+    h.mock_blend.set_claim_amount(&claim);
     h.handler.test_harvest();
     assert_eq!(h.handler.last_harvest_ts(), INITIAL_TS);
+}
+
+#[test]
+fn harvest_skips_last_harvest_ts_on_noop() {
+    let h = setup();
+    // No principal in Blend, no BLND emissions waiting. Harvest fires but
+    // does no work; last_harvest_ts must stay at its prior value.
+    h.handler.test_harvest();
+    assert_eq!(h.handler.last_harvest_ts(), 0);
 }
 
 #[test]
@@ -1513,6 +1528,12 @@ fn full_lifecycle_invariants() {
     h.env.ledger().with_mut(|li| {
         li.timestamp = INITIAL_TS + COOLDOWN_SECS * 10;
     });
+    // Seed a BLND emission so the harvest has visible work to stamp
+    // last_harvest_ts with (interest leg alone happens to net zero against
+    // the mock here).
+    let claim: i128 = 100_000_000;
+    h.blnd_admin.mint(&h.mock_blend_id, &claim);
+    h.mock_blend.set_claim_amount(&claim);
     h.handler.test_harvest();
     let harvest_ts = h.handler.last_harvest_ts();
     assert!(harvest_ts >= INITIAL_TS + COOLDOWN_SECS * 10);
@@ -1544,7 +1565,7 @@ fn full_lifecycle_invariants() {
         0,
         "handler must hold zero USDC at end of lifecycle",
     );
-    // BLND treasury accounting is consistent (mock has no emissions set,
-    // so balance stayed 0 across all phases).
-    assert_eq!(h.blnd_token.balance(&h.blnd_treasury), 0);
+    // BLND treasury collected the 100M stamp seeded in phase 4 (added so
+    // the harvest had observable work and stamped last_harvest_ts).
+    assert_eq!(h.blnd_token.balance(&h.blnd_treasury), 100_000_000);
 }

@@ -165,6 +165,24 @@ impl HarvestPartial {
     }
 }
 
+/// Emitted when `execute_harvest_yield` ran but produced no observable
+/// movement (no BLND claimed, no USDC interest donated). The cron tick
+/// still fired; monitoring can use this event to confirm operator
+/// liveness while gating "last_harvest_ts hasn't advanced" on real work.
+/// `reason` is one of: `"noprin"` (handler holds nothing in Blend),
+/// `"frozen"` (Blend pool status > healthy max), `"noyield"` (interest
+/// leg ran but yielded zero AND BLND claim returned zero).
+#[contractevent]
+pub struct HarvestSkipped {
+    pub reason: Symbol,
+}
+
+impl HarvestSkipped {
+    pub fn new(reason: Symbol) -> Self {
+        Self { reason }
+    }
+}
+
 /// Re-export `Env` for compatibility; not strictly needed but keeps the
 /// publish-call sites readable when the caller already has `env` in scope.
 #[allow(dead_code)]

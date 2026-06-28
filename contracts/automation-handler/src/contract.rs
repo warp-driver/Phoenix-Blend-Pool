@@ -10,7 +10,8 @@ use warpdrive_shared::interfaces::{
 };
 use crate::events::{
     AddressConfigUpdated, BadDebtDetected, ConfigUpdated, EmergencyUnwound, HarvestCompleted,
-    HarvestPartial, PauseToggled, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
+    HarvestPartial, HarvestSkipped, PauseToggled, RebalanceExecuted, DIRECTION_FROM_BLEND,
+    DIRECTION_TO_BLEND,
 };
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
@@ -862,8 +863,21 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
         }
     }
 
-    storage::set_last_harvest_ts(env, env.ledger().timestamp());
-    HarvestCompleted::new(interest_donated, blnd_routed, principal_after).publish(env);
+    let work_done = blnd_routed > 0 || interest_donated > 0;
+    if work_done {
+        storage::set_last_harvest_ts(env, env.ledger().timestamp());
+        HarvestCompleted::new(interest_donated, blnd_routed, principal_after)
+            .publish(env);
+    } else {
+        let reason = if !blend_healthy {
+            soroban_sdk::symbol_short!("frozen")
+        } else if principal == 0 {
+            soroban_sdk::symbol_short!("noprin")
+        } else {
+            soroban_sdk::symbol_short!("noyield")
+        };
+        HarvestSkipped::new(reason).publish(env);
+    }
 
     assert_no_usdc_residue(env);
     Ok(())
