@@ -67,7 +67,7 @@ vars:
   # never holds BLND. Default placeholder; override per deploy with the
   # Phoenix/Blend-coordinated treasury address (DAO multisig, etc).
   BLND_TREASURY: '{{.BLND_TREASURY | default "CB000000000000000000000000000000000000000000000000000000"}}'
-  USDC_RESERVE_TOKEN_ID: '{{.USDC_RESERVE_TOKEN_ID | default "1"}}'
+  USDC_RESERVE_TOKEN_ID: '{{.USDC_RESERVE_TOKEN_ID | default "7"}}'
   # Rebalance policy (handler constructor args). target = 50% (5000 bps),
   # band = +/- 5% (500 bps), min total USDC below which Rebalance is a no-op
   # (1e11 = 10_000 USDC at the SAC's 7 decimals).
