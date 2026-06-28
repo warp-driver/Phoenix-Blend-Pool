@@ -306,6 +306,23 @@ tasks:
         set -euo pipefail
         : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
         : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
+        # Mainnet guard: on the Public Stellar Network, refuse to launch
+        # with the deployer hot key as handler admin (which would collapse
+        # pause / upgrade / emergency-unwind onto a single hot key). An
+        # explicit HANDLER_ADMIN MUST be supplied, and MUST be a contract
+        # address (C-strkey) — typically a Soroban multisig. G-strkeys are
+        # rejected; the admin needs to be revocable / rotatable post-launch
+        # and that's only true for contract-typed admins on Soroban.
+        if [ "{{.NETWORK_PASSPHRASE}}" = "Public Global Stellar Network ; September 2015" ]; then
+          if [ -z "${HANDLER_ADMIN:-}" ]; then
+            echo "HANDLER_ADMIN is required for mainnet deploy (refuse to collapse onto DEPLOYER_ADDRESS)" >&2
+            exit 1
+          fi
+          case "$HANDLER_ADMIN" in
+            C*) ;;
+            *) echo "HANDLER_ADMIN must be a contract (C-strkey, e.g. multisig); got '$HANDLER_ADMIN'" >&2; exit 1;;
+          esac
+        fi
         ADMIN="${HANDLER_ADMIN:-$DEPLOYER_ADDRESS}"
         VERIFICATION=$(jq -r .contracts.ed25519_verification out/deploy.json)
         HANDLER_ADDR=$(stellar contract deploy \
