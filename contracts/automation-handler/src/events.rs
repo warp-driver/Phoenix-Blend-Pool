@@ -147,6 +147,24 @@ impl BadDebtDetected {
     }
 }
 
+/// Emitted when the BLND claim leg of `execute_harvest_yield` succeeded but
+/// the interest leg (withdraw → resupply → donate) was skipped because
+/// Blend's `submit(WITHDRAW)` reverted — usually pool utilization at 100%
+/// or a frozen reserve mid-flight. `blnd_routed` is preserved (BLND went to
+/// treasury); `interest_donated` for the cycle is zero. Monitoring SHOULD
+/// alert on this event so the operator can investigate Blend health before
+/// the next harvest tick.
+#[contractevent]
+pub struct HarvestPartial {
+    pub blnd_routed: i128,
+}
+
+impl HarvestPartial {
+    pub fn new(blnd_routed: i128) -> Self {
+        Self { blnd_routed }
+    }
+}
+
 /// Re-export `Env` for compatibility; not strictly needed but keeps the
 /// publish-call sites readable when the caller already has `env` in scope.
 #[allow(dead_code)]

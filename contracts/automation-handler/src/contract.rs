@@ -10,7 +10,7 @@ use warpdrive_shared::interfaces::{
 };
 use crate::events::{
     AddressConfigUpdated, BadDebtDetected, ConfigUpdated, EmergencyUnwound, HarvestCompleted,
-    PauseToggled, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
+    HarvestPartial, PauseToggled, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
 };
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
@@ -805,35 +805,60 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
     if principal > 0 && blend_healthy {
         let usdc_token = soroban_sdk::token::Client::new(env, &usdc);
         let usdc_before_withdraw = usdc_token.balance(&env.current_contract_address());
-        blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, i128::MAX);
-        let actual_redeemable = usdc_token
-            .balance(&env.current_contract_address())
-            .saturating_sub(usdc_before_withdraw);
 
-        let supply_amount = principal.min(actual_redeemable);
-        if supply_amount > 0 {
-            blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, supply_amount);
-        }
-        storage::set_principal_supplied(env, supply_amount);
-        principal_after = supply_amount;
+        // Withdraw via try_submit so a Blend revert (e.g. utilization at
+        // 100% rejecting the withdraw, status flipping to Frozen between
+        // get_config and submit) does NOT roll back the BLND claim above.
+        // Soroban contract panics roll back the WHOLE tx by default;
+        // try_<method> is the auto-generated recoverable form on every
+        // contractclient trait.
+        let mut requests: Vec<BlendRequest> = Vec::new(env);
+        requests.push_back(BlendRequest {
+            request_type: BLEND_REQUEST_WITHDRAW,
+            address: usdc.clone(),
+            amount: i128::MAX,
+        });
+        let withdraw_ok = matches!(
+            blend.try_submit(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &requests,
+            ),
+            Ok(Ok(_))
+        );
+        if !withdraw_ok {
+            HarvestPartial::new(blnd_routed).publish(env);
+        } else {
+            let actual_redeemable = usdc_token
+                .balance(&env.current_contract_address())
+                .saturating_sub(usdc_before_withdraw);
 
-        // Bad-debt detection: if Blend redeemed less than the handler's
-        // recorded principal, the b-token position has been written down.
-        // Emit a high-signal event for monitoring; the handler proceeds
-        // with the smaller principal (silent correction; not a panic).
-        if actual_redeemable < principal {
-            BadDebtDetected::new(
-                principal,
-                actual_redeemable,
-                principal - actual_redeemable,
-            )
-            .publish(env);
-        }
+            let supply_amount = principal.min(actual_redeemable);
+            if supply_amount > 0 {
+                blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, supply_amount);
+            }
+            storage::set_principal_supplied(env, supply_amount);
+            principal_after = supply_amount;
 
-        let interest = actual_redeemable.saturating_sub(supply_amount);
-        if interest > 0 {
-            donate_to_pool(env, &blended_pool, &usdc, interest);
-            interest_donated = interest;
+            // Bad-debt detection: if Blend redeemed less than the handler's
+            // recorded principal, the b-token position has been written down.
+            // Emit a high-signal event for monitoring; the handler proceeds
+            // with the smaller principal (silent correction; not a panic).
+            if actual_redeemable < principal {
+                BadDebtDetected::new(
+                    principal,
+                    actual_redeemable,
+                    principal - actual_redeemable,
+                )
+                .publish(env);
+            }
+
+            let interest = actual_redeemable.saturating_sub(supply_amount);
+            if interest > 0 {
+                donate_to_pool(env, &blended_pool, &usdc, interest);
+                interest_donated = interest;
+            }
         }
     }
 
