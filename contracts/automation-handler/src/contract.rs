@@ -29,6 +29,17 @@ const BPS_DEN: i128 = 10_000;
 /// always call `emergency_unwind` to drain a Frozen position explicitly.
 const BLEND_HEALTHY_STATUS_MAX: u32 = 3;
 
+/// Maximum age of a quorum envelope's `reference_block` accepted by
+/// `verify_xlm`. The aggregator stamps the envelope with the current
+/// ledger sequence at signature time; the on-chain verification
+/// contract checks the registered signer set AS OF that ledger. A
+/// stale `reference_block` lets a previously-quorate (but since
+/// retired) signer set re-pass verification, so we bound how far back
+/// it can point. 200 ledgers ≈ 17 minutes on mainnet (5-6 s/ledger);
+/// well above any plausible aggregator → operator → submission latency,
+/// well below the security contract's historical-weight retention.
+const MAX_REFERENCE_BLOCK_AGE: u32 = 200;
+
 /// Payload encoded inside the XlmEnvelope by the off-chain circuit + quorum.
 ///
 /// Two variants:
@@ -155,6 +166,13 @@ impl AutomationHandler {
 
         if storage::is_event_seen(&env, &event_id) {
             return Err(HandlerError::EventAlreadySeen);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if sig_data.reference_block > current_ledger
+            || current_ledger - sig_data.reference_block > MAX_REFERENCE_BLOCK_AGE
+        {
+            return Err(HandlerError::InvalidReferenceBlock);
         }
 
         let verification_addr = storage::get_verification_contract(&env);
