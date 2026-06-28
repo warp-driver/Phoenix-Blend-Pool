@@ -546,9 +546,24 @@ tasks:
         POOL=$(jq -r .blended_pool out/testnet/pool.json)
         test -n "$HANDLER" -a "$HANDLER" != "null" || { echo "out/handler.json missing automation_handler"; exit 1; }
         test -n "$POOL"    -a "$POOL"    != "null" || { echo "out/testnet/pool.json missing blended_pool"; exit 1; }
+        # Derive horizon + stellar.expert base from the configured network
+        # passphrase so the same task works for testnet and mainnet without
+        # a separate copy. Env overrides win when set explicitly.
+        case "{{.NETWORK_PASSPHRASE}}" in
+          "Public Global Stellar Network ; September 2015")
+            HORIZON_DEFAULT="https://horizon.stellar.org"
+            EXPERT_DEFAULT="https://stellar.expert/explorer/public"
+            ;;
+          *)
+            HORIZON_DEFAULT="https://horizon-testnet.stellar.org"
+            EXPERT_DEFAULT="https://stellar.expert/explorer/testnet"
+            ;;
+        esac
+        HORIZON_URL="${HORIZON_URL:-$HORIZON_DEFAULT}"
+        STELLAR_EXPERT_BASE="${STELLAR_EXPERT_BASE:-$EXPERT_DEFAULT}"
         jq -n \
           --arg rpc_url            "{{.RPC_URL}}" \
-          --arg horizon_url        "https://horizon-testnet.stellar.org" \
+          --arg horizon_url        "$HORIZON_URL" \
           --arg network_passphrase "{{.NETWORK_PASSPHRASE}}" \
           --arg handler_id         "$HANDLER" \
           --arg blended_pool_id    "$POOL" \
@@ -558,7 +573,7 @@ tasks:
           --arg blnd_id            "{{.BLND}}" \
           --arg source_account     "$DEPLOYER_ADDRESS" \
           --arg deployer_address   "$DEPLOYER_ADDRESS" \
-          --arg stellar_expert     "https://stellar.expert/explorer/testnet" \
+          --arg stellar_expert     "$STELLAR_EXPERT_BASE" \
           '{ rpc_url: $rpc_url,
              horizon_url: $horizon_url,
              network_passphrase: $network_passphrase,
