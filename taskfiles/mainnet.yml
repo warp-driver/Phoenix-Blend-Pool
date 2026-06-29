@@ -55,6 +55,12 @@ vars:
   # and exit while the pool warms up.
   MIN_TRADING_USDC_MAINNET: '50000000000'
   MIN_TRADING_XLM_MAINNET: '0'
+  # Pool-side per-swap slippage cap. Phoenix's default max_allowed_spread_bps
+  # is 500 (5%); for the mainnet bootstrap we lock it tighter at 100 (1%) so
+  # any swap that would move the price by more than 1% reverts. This is the
+  # primary defence against thin-pool exploitation in the warm-up window —
+  # admin can widen via update_config post-launch if depth + volume warrant.
+  POOL_MAX_SPREAD_BPS_MAINNET: '100'
 
 tasks:
   confirm:
@@ -92,6 +98,7 @@ tasks:
       REBALANCE_COOLDOWN_SECS: '{{.REBALANCE_COOLDOWN_SECS_MAINNET}}'
       MIN_TRADING_USDC: '{{.MIN_TRADING_USDC_MAINNET}}'
       MIN_TRADING_XLM: '{{.MIN_TRADING_XLM_MAINNET}}'
+      POOL_MAX_SPREAD_BPS: '{{.POOL_MAX_SPREAD_BPS_MAINNET}}'
     cmds:
       - task: confirm
       - task: testnet:preflight
