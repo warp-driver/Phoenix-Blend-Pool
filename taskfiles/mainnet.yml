@@ -47,13 +47,13 @@ vars:
   # below a non-trivial total. Override per-deploy via env if needed.
   TARGET_RATIO_BPS_MAINNET: '5000'
   REBALANCE_BAND_BPS_MAINNET: '500'
-  MIN_TOTAL_USDC_MAINNET: '50000000000'
+  MIN_TOTAL_USDC_MAINNET: '500000000000'
   REBALANCE_COOLDOWN_SECS_MAINNET: '300'
-  # Pool-side bootstrap trading floor. Default 50_000 USDC on the USDC side,
-  # 0 on the XLM side (single-anchor gate). Below the floor, `swap` reverts;
-  # `provide_liquidity` / `withdraw_liquidity` remain open so LPs can seed
-  # and exit while the pool warms up.
-  MIN_TRADING_USDC_MAINNET: '50000000000'
+  # Pool-side bootstrap trading floor is intentionally disabled on mainnet
+  # (value 0 = no gate). The 1% max-spread cap below is the only swap-time
+  # guard; trading is always-on so arbitrage can keep the pool's XLM/USDC
+  # price coupled to the external market continuously.
+  MIN_TRADING_USDC_MAINNET: '0'
   MIN_TRADING_XLM_MAINNET: '0'
   # Pool-side per-swap slippage cap. Phoenix's default max_allowed_spread_bps
   # is 500 (5%); for the mainnet bootstrap we lock it tighter at 100 (1%) so
@@ -109,7 +109,6 @@ tasks:
       - task: testnet:lookup-usdc-reserve
       - task: testnet:deploy-handler-stack
       - task: testnet:set-delegate
-      - task: set-trading-floor
       - task: testnet:verify-deploy
       - task: testnet:make-frontend-config
       - |
