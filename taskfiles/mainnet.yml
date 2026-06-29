@@ -47,7 +47,7 @@ vars:
   # below a non-trivial total. Override per-deploy via env if needed.
   TARGET_RATIO_BPS_MAINNET: '5000'
   REBALANCE_BAND_BPS_MAINNET: '500'
-  MIN_TOTAL_USDC_MAINNET: '1000000000000'
+  MIN_TOTAL_USDC_MAINNET: '50000000000'
   REBALANCE_COOLDOWN_SECS_MAINNET: '300'
 
 tasks:
