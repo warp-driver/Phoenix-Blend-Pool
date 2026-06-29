@@ -80,6 +80,13 @@ vars:
   # Minimum seconds between two successive rebalance moves. 300s = 5 min:
   # plenty of room for trading flow to settle and avoid Blend min-supply churn.
   REBALANCE_COOLDOWN_SECS: '{{.REBALANCE_COOLDOWN_SECS | default "300"}}'
+  # Critical-liquid floor (bps of total USDC). When the pool's liquid-side
+  # ratio drops below this floor, execute_rebalance bypasses the cooldown
+  # gate and fires a FromBlend rebalance immediately. 0 = feature disabled.
+  # Default 2000 (20%) — well below the normal lower band (target - band =
+  # 4500 bps = 45%) so the bypass only fires under genuine drift, not within
+  # the routine band.
+  CRITICAL_LIQUID_FLOOR_BPS: '{{.CRITICAL_LIQUID_FLOOR_BPS | default "2000"}}'
   # Pool-side bootstrap trading floor (pool.set_min_trading_balances). Below
   # these reserves `swap` reverts with TradingFloorNotMet; provide_liquidity
   # and withdraw_liquidity are unaffected. Default 0 = no gate. Mainnet
@@ -351,7 +358,8 @@ tasks:
             --target_ratio_bps "{{.TARGET_RATIO_BPS}}" \
             --rebalance_band_bps "{{.REBALANCE_BAND_BPS}}" \
             --min_total_usdc "{{.MIN_TOTAL_USDC}}" \
-            --rebalance_cooldown_secs "{{.REBALANCE_COOLDOWN_SECS}}")
+            --rebalance_cooldown_secs "{{.REBALANCE_COOLDOWN_SECS}}" \
+            --critical_liquid_floor_bps "{{.CRITICAL_LIQUID_FLOOR_BPS}}")
         echo "{\"automation_handler\":\"$HANDLER_ADDR\"}" | jq . > out/handler.json
         cat out/handler.json
 
@@ -759,6 +767,7 @@ tasks:
         check rebalance_band_bps "{{.REBALANCE_BAND_BPS}}"
         check min_total_usdc "{{.MIN_TOTAL_USDC}}"
         check rebalance_cooldown_secs "{{.REBALANCE_COOLDOWN_SECS}}"
+        check critical_liquid_floor_bps "{{.CRITICAL_LIQUID_FLOOR_BPS}}"
         check paused         "false"
 
         # Pool-side check: delegate must equal the handler.

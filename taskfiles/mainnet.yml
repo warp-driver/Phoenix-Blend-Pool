@@ -49,6 +49,12 @@ vars:
   REBALANCE_BAND_BPS_MAINNET: '500'
   MIN_TOTAL_USDC_MAINNET: '500000000000'
   REBALANCE_COOLDOWN_SECS_MAINNET: '300'
+  # Critical-liquid floor (bps of total USDC). Below this fraction of
+  # total, execute_rebalance bypasses the cooldown and fires a FromBlend
+  # immediately. Default 2000 (20%) — well below the normal 4500 bps lower
+  # band so the bypass only fires under genuine drift. Tighter than the
+  # band gives more headroom; 0 disables the bypass entirely.
+  CRITICAL_LIQUID_FLOOR_BPS_MAINNET: '2000'
   # Pool-side bootstrap trading floor is intentionally disabled on mainnet
   # (value 0 = no gate). The 1% max-spread cap below is the only swap-time
   # guard; trading is always-on so arbitrage can keep the pool's XLM/USDC
@@ -96,6 +102,7 @@ tasks:
       REBALANCE_BAND_BPS: '{{.REBALANCE_BAND_BPS_MAINNET}}'
       MIN_TOTAL_USDC: '{{.MIN_TOTAL_USDC_MAINNET}}'
       REBALANCE_COOLDOWN_SECS: '{{.REBALANCE_COOLDOWN_SECS_MAINNET}}'
+      CRITICAL_LIQUID_FLOOR_BPS: '{{.CRITICAL_LIQUID_FLOOR_BPS_MAINNET}}'
       MIN_TRADING_USDC: '{{.MIN_TRADING_USDC_MAINNET}}'
       MIN_TRADING_XLM: '{{.MIN_TRADING_XLM_MAINNET}}'
       POOL_MAX_SPREAD_BPS: '{{.POOL_MAX_SPREAD_BPS_MAINNET}}'
