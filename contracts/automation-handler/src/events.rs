@@ -147,6 +147,24 @@ impl BadDebtDetected {
     }
 }
 
+/// Emitted when execute_rebalance bypassed the cooldown gate because the
+/// pool's liquid USDC ratio fell below `critical_liquid_floor_bps`.
+/// Distinct from `RebalanceExecuted` so monitoring can alert specifically
+/// on the critical-bypass path. `liquid_ratio_bps` is the ratio AT entry
+/// (before the move); `floor_bps` is the configured floor.
+#[contractevent]
+pub struct CriticalRebalance {
+    pub liquid_ratio_bps: u32,
+    pub floor_bps: u32,
+    pub bypassed_cooldown_secs: u64,
+}
+
+impl CriticalRebalance {
+    pub fn new(liquid_ratio_bps: u32, floor_bps: u32, bypassed_cooldown_secs: u64) -> Self {
+        Self { liquid_ratio_bps, floor_bps, bypassed_cooldown_secs }
+    }
+}
+
 /// Emitted when the BLND claim leg of `execute_harvest_yield` succeeded but
 /// the interest leg (withdraw → resupply → donate) was skipped because
 /// Blend's `submit(WITHDRAW)` reverted — usually pool utilization at 100%

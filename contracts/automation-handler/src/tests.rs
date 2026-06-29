@@ -33,6 +33,7 @@ const MAX_REBALANCE_AMOUNT: i128 = 0; // unlimited (0 sentinel)
 #[allow(dead_code)]
 const MIN_REBALANCE_AMOUNT: i128 = 0; // no dust floor
 const COOLDOWN_SECS: u64 = 60;
+const CRITICAL_FLOOR_BPS: u32 = 2_000; // 20%
 const USDC_RESERVE_TOKEN_ID: u32 = 1;
 const INITIAL_TS: u64 = 1_000_000;
 
@@ -331,6 +332,7 @@ fn setup() -> Harness<'static> {
             BAND_BPS,
             MIN_TOTAL_USDC,
             COOLDOWN_SECS,
+            CRITICAL_FLOOR_BPS,
         ),
     );
 
@@ -532,6 +534,163 @@ fn rebalance_from_blend_caps_at_principal() {
     let dp = h.mock_pool.last_deposit().expect("deposit_from_delegate not called");
     assert_eq!(dp, (h.usdc.clone(), small_principal));
     assert_eq!(h.handler.principal_supplied(), 0);
+}
+
+// --- Critical liquid-floor cooldown bypass tests -----------------------------
+
+/// Liquid USDC at 10% of total (below the 20% critical floor) MUST fire a
+/// FromBlend rebalance even though the cooldown is still active. Verifies
+/// both the principal decrease AND that the handler emitted the dedicated
+/// `CriticalRebalance` event in addition to `RebalanceExecuted`.
+#[test]
+fn rebalance_critical_floor_bypasses_cooldown() {
+    let h = setup();
+    // 100B liquid + 900B delegated = 1T total → ratio = 10% (below 20% floor).
+    let liquid: i128 = 100_000_000_000;
+    let delegated: i128 = 900_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    // Seed Blend with the full delegated principal so the FromBlend leg has
+    // tokens to pull back.
+    seed_blend_supply(&h, delegated);
+    // Cooldown is active: pretend the previous rebalance happened "just now".
+    // Single top-level call: set last_rebalance_ts AND run the rebalance.
+    // Soroban's `env.events().all()` reflects only the last invocation, so a
+    // separate `test_set_last_rebalance_ts` call would clobber the buffer.
+    h.handler.test_rebalance_with_last_ts(&INITIAL_TS);
+
+    // Snapshot the events buffer FIRST — every handler query below is a fresh
+    // top-level invocation that would overwrite it.
+    let evt_count = h
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&h.handler_id)
+        .events()
+        .len();
+
+    // FromBlend fired: principal shrank, Withdraw/Deposit observed.
+    let wd = h.mock_blend.last_submit_withdraw().expect("Blend Withdraw not called");
+    assert_eq!(wd.0, h.usdc);
+    assert!(wd.1 > 0, "withdraw amount must be positive");
+    let dp = h.mock_pool.last_deposit().expect("deposit_from_delegate not called");
+    assert_eq!(dp.0, h.usdc);
+    assert_eq!(dp.1, wd.1);
+    assert!(
+        h.handler.principal_supplied() < delegated,
+        "principal should shrink after a bypass-driven FromBlend",
+    );
+    assert_eq!(h.handler.last_rebalance_ts(), INITIAL_TS);
+
+    // Handler MUST emit RebalanceExecuted + CriticalRebalance = exactly 2
+    // events on a critical-bypass invocation.
+    assert_eq!(
+        evt_count, 2,
+        "expected RebalanceExecuted + CriticalRebalance, got {}",
+        evt_count,
+    );
+}
+
+/// Below the normal 45% lower band but ABOVE the 20% critical floor: the
+/// cooldown gate MUST still block. Confirms the bypass does not collapse
+/// the cooldown into "any below-band drift" — only below-floor drift.
+#[test]
+fn rebalance_normal_cooldown_still_gates_above_floor() {
+    let h = setup();
+    // 400B liquid + 600B delegated = 1T total → ratio = 40%.
+    let liquid: i128 = 400_000_000_000;
+    let delegated: i128 = 600_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    seed_blend_supply(&h, delegated);
+    h.handler.test_rebalance_with_last_ts(&INITIAL_TS);
+
+    // Snapshot the events buffer BEFORE any handler query overwrites it.
+    let evt_count = h
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&h.handler_id)
+        .events()
+        .len();
+
+    // No FromBlend fired: cooldown is the only rate-limit and it's active.
+    assert!(h.mock_blend.last_submit_withdraw().is_none());
+    assert!(h.mock_pool.last_deposit().is_none());
+    assert_eq!(h.handler.principal_supplied(), delegated);
+    // No handler event should appear from the gated rebalance call.
+    assert_eq!(
+        evt_count, 0,
+        "no event must fire when the cooldown gate blocks",
+    );
+}
+
+/// Over-liquid pool (liquid >> upper band) with a critical floor configured:
+/// the bypass MUST NOT fire because it is restricted to the FromBlend side.
+/// Set the floor to 9500 bps so the first two clauses of `is_critical` (floor
+/// > 0, ratio < floor) both pass; only the `liquid_usdc < target_liquid`
+/// clause keeps the bypass dormant on ToBlend drift.
+#[test]
+fn rebalance_critical_floor_does_not_bypass_to_blend() {
+    let h = setup();
+    h.handler.set_critical_liquid_floor_bps(&9_500);
+    // 900B liquid + 100B delegated = 1T total → ratio = 90% (over-liquid).
+    let liquid: i128 = 900_000_000_000;
+    let delegated: i128 = 100_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    // Mint USDC into the pool so a hypothetical ToBlend leg COULD source it.
+    h.usdc_admin.mint(&h.mock_pool_id, &liquid);
+    h.handler.test_rebalance_with_last_ts(&INITIAL_TS);
+
+    // Snapshot the events buffer BEFORE any handler query overwrites it.
+    let evt_count = h
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&h.handler_id)
+        .events()
+        .len();
+
+    // ToBlend would have fired without cooldown, but the bypass is
+    // FromBlend-only, so cooldown blocks.
+    assert!(h.mock_pool.last_withdraw().is_none());
+    assert!(h.mock_blend.last_submit_supply().is_none());
+    assert_eq!(h.handler.principal_supplied(), 0);
+    assert_eq!(
+        evt_count, 0,
+        "cooldown must block ToBlend even with critical_floor configured",
+    );
+}
+
+/// `critical_liquid_floor_bps == 0` is the disabled sentinel. Even a ratio
+/// of 5% (well below any reasonable floor) MUST be gated by the normal
+/// cooldown when the feature is turned off.
+#[test]
+fn rebalance_critical_floor_disabled_when_zero() {
+    let h = setup();
+    h.handler.set_critical_liquid_floor_bps(&0);
+    // 50B liquid + 950B delegated = 1T total → ratio = 5%.
+    let liquid: i128 = 50_000_000_000;
+    let delegated: i128 = 950_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    seed_blend_supply(&h, delegated);
+    h.handler.test_rebalance_with_last_ts(&INITIAL_TS);
+
+    // Snapshot the events buffer BEFORE any handler query overwrites it.
+    let evt_count = h
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&h.handler_id)
+        .events()
+        .len();
+
+    // Bypass is disabled; cooldown alone gates the call → no fire.
+    assert!(h.mock_blend.last_submit_withdraw().is_none());
+    assert!(h.mock_pool.last_deposit().is_none());
+    assert_eq!(h.handler.principal_supplied(), delegated);
+    assert_eq!(
+        evt_count, 0,
+        "disabled bypass (floor=0) must not fire even at 5% ratio",
+    );
 }
 
 // --- Harvest tests -----------------------------------------------------------

@@ -9,9 +9,9 @@ use warpdrive_shared::interfaces::{
     warpdrive::{ContractUpgraded, WarpDriveInterface},
 };
 use crate::events::{
-    AddressConfigUpdated, BadDebtDetected, ConfigUpdated, EmergencyUnwound, HarvestCompleted,
-    HarvestPartial, HarvestSkipped, PauseToggled, RebalanceExecuted, DIRECTION_FROM_BLEND,
-    DIRECTION_TO_BLEND,
+    AddressConfigUpdated, BadDebtDetected, ConfigUpdated, CriticalRebalance, EmergencyUnwound,
+    HarvestCompleted, HarvestPartial, HarvestSkipped, PauseToggled, RebalanceExecuted,
+    DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
 };
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
@@ -83,6 +83,7 @@ pub struct HandlerState {
     pub usdc_reserve_token_id: u32,
     pub target_ratio_bps: u32,
     pub rebalance_band_bps: u32,
+    pub critical_liquid_floor_bps: u32,
     pub min_total_usdc: i128,
     pub max_rebalance_amount: i128,
     pub min_rebalance_amount: i128,
@@ -114,6 +115,7 @@ impl AutomationHandler {
         rebalance_band_bps: u32,
         min_total_usdc: i128,
         rebalance_cooldown_secs: u64,
+        critical_liquid_floor_bps: u32,
     ) {
         assert!(
             target_ratio_bps > 0 && target_ratio_bps < BPS_DEN as u32,
@@ -122,6 +124,10 @@ impl AutomationHandler {
         assert!(
             rebalance_band_bps < BPS_DEN as u32,
             "rebalance_band_bps must be < 10000"
+        );
+        assert!(
+            critical_liquid_floor_bps <= BPS_DEN as u32,
+            "critical_liquid_floor_bps must be <= 10000"
         );
         assert!(min_total_usdc >= 0, "min_total_usdc must be non-negative");
         if usdc_reserve_token_id % 2 == 0 {
@@ -141,6 +147,7 @@ impl AutomationHandler {
         storage::set_usdc_reserve_token_id(&env, usdc_reserve_token_id);
         storage::set_target_ratio_bps(&env, target_ratio_bps);
         storage::set_rebalance_band_bps(&env, rebalance_band_bps);
+        storage::save_critical_liquid_floor_bps(&env, critical_liquid_floor_bps);
         storage::set_min_total_usdc(&env, min_total_usdc);
         // max/min rebalance scope limits default to 0 ("unlimited" / "no
         // floor") and are tightened post-deploy by the admin via setters.
@@ -229,6 +236,10 @@ impl AutomationHandler {
         storage::get_rebalance_band_bps(&env)
     }
 
+    pub fn critical_liquid_floor_bps(env: Env) -> u32 {
+        storage::get_critical_liquid_floor_bps(&env)
+    }
+
     pub fn min_total_usdc(env: Env) -> i128 {
         storage::get_min_total_usdc(&env)
     }
@@ -279,6 +290,7 @@ impl AutomationHandler {
             usdc_reserve_token_id: storage::get_usdc_reserve_token_id(&env),
             target_ratio_bps: storage::get_target_ratio_bps(&env),
             rebalance_band_bps: storage::get_rebalance_band_bps(&env),
+            critical_liquid_floor_bps: storage::get_critical_liquid_floor_bps(&env),
             min_total_usdc: storage::get_min_total_usdc(&env),
             max_rebalance_amount: storage::get_max_rebalance_amount(&env),
             min_rebalance_amount: storage::get_min_rebalance_amount(&env),
@@ -513,6 +525,21 @@ impl AutomationHandler {
         storage::extend_instance_ttl(&env);
     }
 
+    /// Admin-only: critical liquid-USDC ratio (bps) below which
+    /// `execute_rebalance` bypasses the cooldown gate and pulls USDC from
+    /// Blend immediately. `0` disables the bypass entirely (cooldown is the
+    /// only rate-limit). Must be `<= 10000` bps.
+    pub fn set_critical_liquid_floor_bps(env: Env, bps: u32) {
+        storage::get_admin(&env).require_auth();
+        assert!(
+            bps <= BPS_DEN as u32,
+            "critical_liquid_floor_bps must be <= 10000"
+        );
+        storage::save_critical_liquid_floor_bps(&env, bps);
+        ConfigUpdated::new(soroban_sdk::symbol_short!("crit_bps"), bps as i128).publish(&env);
+        storage::extend_instance_ttl(&env);
+    }
+
     /// Admin-only: floor on total pool USDC below which Rebalance is a
     /// no-op (does not consume cooldown).
     pub fn set_min_total_usdc(env: Env, amount: i128) {
@@ -614,6 +641,16 @@ impl AutomationHandler {
         execute_rebalance(&env)
     }
 
+    /// Set `last_rebalance_ts` and run `execute_rebalance` in a SINGLE
+    /// top-level invocation. The Soroban test env's `events().all()` returns
+    /// events from the most recent top-level call only, so tests that want to
+    /// inspect events emitted by `execute_rebalance` MUST avoid sandwiching
+    /// other handler calls between the setup and the rebalance.
+    pub fn test_rebalance_with_last_ts(env: Env, last_ts: u64) -> Result<(), HandlerError> {
+        storage::set_last_rebalance_ts(&env, last_ts);
+        execute_rebalance(&env)
+    }
+
     pub fn test_harvest(env: Env) -> Result<(), HandlerError> {
         execute_harvest_yield(&env)
     }
@@ -669,16 +706,10 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         return Err(HandlerError::InvalidEnvelope);
     }
 
-    // Cooldown gate: only ACTIONS (actual fund moves) are rate-limited.
-    // No-op branches (below min, within band, dust) return without touching
-    // last_rebalance_ts, so the next event after a gap can still react.
-    let now = env.ledger().timestamp();
-    let last_ts = storage::get_last_rebalance_ts(env);
-    let cooldown = storage::get_rebalance_cooldown_secs(env);
-    if now < last_ts.saturating_add(cooldown) {
-        return Ok(());
-    }
-
+    // Compute the target / band BEFORE the cooldown gate because the
+    // critical-low bypass below needs `target_liquid` to know whether the
+    // pool is under-liquid (the bypass only ever fires on the FromBlend
+    // side; we never want to bypass cooldown for an over-liquid rebalance).
     let target_bps = storage::get_target_ratio_bps(env) as i128;
     let band_bps = storage::get_rebalance_band_bps(env) as i128;
     let target_liquid = mul_div(total_usdc, target_bps, BPS_DEN)?;
@@ -687,6 +718,38 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         .checked_add(band)
         .ok_or(HandlerError::OtherInvocationError)?;
     let lower = target_liquid.saturating_sub(band);
+
+    // Cooldown gate: only ACTIONS (actual fund moves) are rate-limited.
+    // No-op branches (below min, within band, dust) return without touching
+    // last_rebalance_ts, so the next event after a gap can still react.
+    let now = env.ledger().timestamp();
+    let last_ts = storage::get_last_rebalance_ts(env);
+    let cooldown = storage::get_rebalance_cooldown_secs(env);
+    let cooldown_active = now < last_ts.saturating_add(cooldown);
+
+    // Critical-low bypass: if liquid USDC has dropped catastrophically below
+    // the configured floor (e.g. a burst of large swaps drained the pool's
+    // liquid side while we were in cooldown), fire the rebalance now
+    // regardless. The floor_bps is a fraction of `total_usdc` (= liquid +
+    // delegated); below it, the pool is at risk of not being able to satisfy
+    // near-term swap volume. `critical_floor_bps == 0` is the "disabled"
+    // sentinel — the bypass never fires and the normal cooldown gate is the
+    // only rate-limit. The `liquid_usdc < target_liquid` clause keeps the
+    // bypass restricted to the FromBlend side: we never want to skip the
+    // cooldown for an over-liquid (ToBlend) rebalance.
+    let critical_floor_bps = storage::get_critical_liquid_floor_bps(env);
+    let liquid_ratio_bps = if total_usdc > 0 {
+        mul_div(liquid_usdc, BPS_DEN, total_usdc)? as u32
+    } else {
+        0
+    };
+    let is_critical = critical_floor_bps > 0
+        && liquid_ratio_bps < critical_floor_bps
+        && liquid_usdc < target_liquid;
+
+    if cooldown_active && !is_critical {
+        return Ok(());
+    }
 
     let delegated_before = total_usdc - liquid_usdc;
     let max_cap = storage::get_max_rebalance_amount(env);
@@ -756,6 +819,14 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
                 principal_after,
             )
             .publish(env);
+            if is_critical && cooldown_active {
+                CriticalRebalance::new(
+                    liquid_ratio_bps,
+                    critical_floor_bps,
+                    last_ts.saturating_add(cooldown).saturating_sub(now),
+                )
+                .publish(env);
+            }
         }
     }
     // Inside the band: no-op.
