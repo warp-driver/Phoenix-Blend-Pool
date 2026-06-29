@@ -624,14 +624,18 @@ fn rebalance_normal_cooldown_still_gates_above_floor() {
 }
 
 /// Over-liquid pool (liquid >> upper band) with a critical floor configured:
-/// the bypass MUST NOT fire because it is restricted to the FromBlend side.
-/// Set the floor to 9500 bps so the first two clauses of `is_critical` (floor
-/// > 0, ratio < floor) both pass; only the `liquid_usdc < target_liquid`
-/// clause keeps the bypass dormant on ToBlend drift.
+/// the bypass MUST NOT fire because the floor is, by the setter invariant,
+/// strictly below the lower band (and therefore strictly below the target).
+/// An over-liquid pool has `liquid_ratio_bps > target_bps > floor_bps`, so
+/// the `liquid_ratio_bps < critical_floor_bps` clause of `is_critical` is
+/// FALSE and the cooldown alone gates the ToBlend leg. Sets the floor to
+/// 4_499 (the maximum the setter allows: lower_band = 5_000 - 500 = 4_500,
+/// bound is strictly less) to exercise the highest legal floor against an
+/// over-liquid scenario.
 #[test]
 fn rebalance_critical_floor_does_not_bypass_to_blend() {
     let h = setup();
-    h.handler.set_critical_liquid_floor_bps(&9_500);
+    h.handler.set_critical_liquid_floor_bps(&4_499);
     // 900B liquid + 100B delegated = 1T total → ratio = 90% (over-liquid).
     let liquid: i128 = 900_000_000_000;
     let delegated: i128 = 100_000_000_000;
@@ -650,7 +654,8 @@ fn rebalance_critical_floor_does_not_bypass_to_blend() {
         .len();
 
     // ToBlend would have fired without cooldown, but the bypass is
-    // FromBlend-only, so cooldown blocks.
+    // FromBlend-only AND ratio > floor under the new setter bound, so
+    // cooldown blocks.
     assert!(h.mock_pool.last_withdraw().is_none());
     assert!(h.mock_blend.last_submit_supply().is_none());
     assert_eq!(h.handler.principal_supplied(), 0);
@@ -690,6 +695,64 @@ fn rebalance_critical_floor_disabled_when_zero() {
     assert_eq!(
         evt_count, 0,
         "disabled bypass (floor=0) must not fire even at 5% ratio",
+    );
+}
+
+/// Critical-low bypass fires conceptually (ratio below floor, cooldown
+/// active) but `principal_supplied == 0` means the FromBlend leg has
+/// nothing to pull. Pre-fix, the inner `if amount > 0` branch
+/// short-circuited silently and no event surfaced — operators couldn't
+/// tell "no bypass needed" from "bypass needed but impossible". The
+/// handler now emits exactly one `CriticalBypassUnavailable` event and
+/// nothing else: no Withdraw / Deposit fires, principal stays 0,
+/// last_rebalance_ts is NOT bumped (no action consumed the cooldown).
+#[test]
+fn rebalance_critical_floor_emits_unavailable_when_principal_zero() {
+    let h = setup();
+    // 100B liquid + 900B delegated = 1T total → ratio = 10% (below 20% floor).
+    let liquid: i128 = 100_000_000_000;
+    let delegated: i128 = 900_000_000_000;
+    set_usdc_state(&h, liquid, delegated);
+    // Intentionally do NOT seed_blend_supply: the handler holds nothing in
+    // Blend, so the FromBlend math bottoms out at amount=0.
+    h.handler.test_set_principal_supplied(&0);
+    // Cooldown active (last rebalance "just now"); single top-level call so
+    // events().all() reflects only execute_rebalance's emissions.
+    h.handler.test_rebalance_with_last_ts(&INITIAL_TS);
+
+    let evt_count = h
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&h.handler_id)
+        .events()
+        .len();
+
+    // No fund movement: nothing pulled from Blend, nothing deposited to pool.
+    assert!(
+        h.mock_blend.last_submit_withdraw().is_none(),
+        "Blend Withdraw must not fire when principal is zero",
+    );
+    assert!(
+        h.mock_pool.last_deposit().is_none(),
+        "deposit_from_delegate must not fire when no funds were pulled",
+    );
+    assert_eq!(
+        h.handler.principal_supplied(),
+        0,
+        "principal_supplied must remain zero (nothing was withdrawn)",
+    );
+    // Last rebalance ts must remain at the planted INITIAL_TS — no real
+    // action ran, so the cooldown window is NOT re-armed.
+    assert_eq!(h.handler.last_rebalance_ts(), INITIAL_TS);
+
+    // Exactly ONE handler event: CriticalBypassUnavailable. The standard
+    // path would emit RebalanceExecuted + CriticalRebalance (2 events);
+    // here neither fires because no funds moved.
+    assert_eq!(
+        evt_count, 1,
+        "expected exactly one CriticalBypassUnavailable event, got {}",
+        evt_count,
     );
 }
 
@@ -1297,6 +1360,32 @@ fn admin_can_retune_rebalance_band_bps() {
 fn rebalance_band_at_cap_rejected() {
     let h = setup();
     h.handler.set_rebalance_band_bps(&10_000);
+}
+
+/// Setter MUST reject any floor ≥ lower band (target_ratio_bps -
+/// rebalance_band_bps). With the harness defaults (target=5000, band=500)
+/// the bound is `< 4500`, so 4500 itself must panic. Pre-fix the setter
+/// only checked `bps <= 10000`, which left an admin typo of 4500/9500/etc.
+/// free to disable the cooldown gate. The setter now panics with
+/// `HandlerError::InvalidEnvelope` (503).
+#[test]
+#[should_panic(expected = "Error(Contract, #503)")]
+fn set_critical_liquid_floor_bps_rejects_at_or_above_lower_band() {
+    let h = setup();
+    // lower_band = TARGET_BPS (5000) - BAND_BPS (500) = 4500. The bound is
+    // strict (`bps < lower`), so 4500 is rejected.
+    h.handler.set_critical_liquid_floor_bps(&4_500);
+}
+
+/// Setter MUST accept any floor strictly below the lower band. Pairs with
+/// the rejection test above to pin the boundary at 4_499 / 4_500 for the
+/// harness defaults.
+#[test]
+fn set_critical_liquid_floor_bps_accepts_below_lower_band() {
+    let h = setup();
+    // lower_band = 4500; 4499 is the largest allowed value.
+    h.handler.set_critical_liquid_floor_bps(&4_499);
+    assert_eq!(h.handler.critical_liquid_floor_bps(), 4_499);
 }
 
 #[test]

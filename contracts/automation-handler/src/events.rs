@@ -165,6 +165,40 @@ impl CriticalRebalance {
     }
 }
 
+/// Emitted when execute_rebalance determined a critical-low bypass was
+/// warranted (liquid_ratio < critical_floor, cooldown active) but the
+/// rebalance couldn't actually pull funds from Blend — most commonly
+/// because the handler has no principal supplied (principal_supplied == 0)
+/// after an emergency_unwind or before the first ToBlend ever fired.
+/// Monitoring SHOULD treat this as a high-severity alert: the pool is at
+/// critical-low liquid but the handler cannot help. `reason` is a short
+/// Symbol describing the cause (currently only `"no_princ"` is emitted —
+/// principal_supplied == 0 — but the field reserves space for future
+/// causes without a schema break).
+#[contractevent]
+pub struct CriticalBypassUnavailable {
+    pub liquid_ratio_bps: u32,
+    pub floor_bps: u32,
+    pub principal_supplied: i128,
+    pub reason: Symbol,
+}
+
+impl CriticalBypassUnavailable {
+    pub fn new(
+        liquid_ratio_bps: u32,
+        floor_bps: u32,
+        principal_supplied: i128,
+        reason: Symbol,
+    ) -> Self {
+        Self {
+            liquid_ratio_bps,
+            floor_bps,
+            principal_supplied,
+            reason,
+        }
+    }
+}
+
 /// Emitted when the BLND claim leg of `execute_harvest_yield` succeeded but
 /// the interest leg (withdraw → resupply → donate) was skipped because
 /// Blend's `submit(WITHDRAW)` reverted — usually pool utilization at 100%

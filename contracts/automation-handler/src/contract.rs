@@ -9,9 +9,9 @@ use warpdrive_shared::interfaces::{
     warpdrive::{ContractUpgraded, WarpDriveInterface},
 };
 use crate::events::{
-    AddressConfigUpdated, BadDebtDetected, ConfigUpdated, CriticalRebalance, EmergencyUnwound,
-    HarvestCompleted, HarvestPartial, HarvestSkipped, PauseToggled, RebalanceExecuted,
-    DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
+    AddressConfigUpdated, BadDebtDetected, ConfigUpdated, CriticalBypassUnavailable,
+    CriticalRebalance, EmergencyUnwound, HarvestCompleted, HarvestPartial, HarvestSkipped,
+    PauseToggled, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
 };
 use crate::externals::{
     BlendPoolClient, BlendRequest, BlendedPoolClient, BLEND_REQUEST_SUPPLY, BLEND_REQUEST_WITHDRAW,
@@ -125,9 +125,16 @@ impl AutomationHandler {
             rebalance_band_bps < BPS_DEN as u32,
             "rebalance_band_bps must be < 10000"
         );
+        // critical_liquid_floor_bps strictly below the normal lower band
+        // (target - band). Above that, the floor would overlap with the
+        // normal cooldown-respecting rebalance window — letting an admin
+        // typo (e.g. 9_999) effectively disable the cooldown gate entirely.
+        // Below the lower band, the bypass only ever fires for genuinely
+        // critical drift.
+        let lower_band = target_ratio_bps.saturating_sub(rebalance_band_bps);
         assert!(
-            critical_liquid_floor_bps <= BPS_DEN as u32,
-            "critical_liquid_floor_bps must be <= 10000"
+            critical_liquid_floor_bps < lower_band,
+            "critical_liquid_floor_bps must be < target_ratio_bps - rebalance_band_bps"
         );
         assert!(min_total_usdc >= 0, "min_total_usdc must be non-negative");
         if usdc_reserve_token_id % 2 == 0 {
@@ -528,13 +535,23 @@ impl AutomationHandler {
     /// Admin-only: critical liquid-USDC ratio (bps) below which
     /// `execute_rebalance` bypasses the cooldown gate and pulls USDC from
     /// Blend immediately. `0` disables the bypass entirely (cooldown is the
-    /// only rate-limit). Must be `<= 10000` bps.
+    /// only rate-limit).
+    ///
+    /// Bound: must be strictly less than the normal lower band
+    /// (`target_ratio_bps - rebalance_band_bps`). Above that, the bypass
+    /// would overlap with the normal cooldown-respecting rebalance window,
+    /// effectively disabling the cooldown gate. An admin typo near 10_000
+    /// is the canonical failure this guard prevents. The bypass is only
+    /// ever useful for ratios genuinely BELOW the lower band, so the bound
+    /// rejects anything else.
     pub fn set_critical_liquid_floor_bps(env: Env, bps: u32) {
         storage::get_admin(&env).require_auth();
-        assert!(
-            bps <= BPS_DEN as u32,
-            "critical_liquid_floor_bps must be <= 10000"
-        );
+        let target = storage::get_target_ratio_bps(&env);
+        let band = storage::get_rebalance_band_bps(&env);
+        let lower = target.saturating_sub(band);
+        if bps >= lower {
+            soroban_sdk::panic_with_error!(&env, HandlerError::InvalidEnvelope);
+        }
         storage::save_critical_liquid_floor_bps(&env, bps);
         ConfigUpdated::new(soroban_sdk::symbol_short!("crit_bps"), bps as i128).publish(&env);
         storage::extend_instance_ttl(&env);
@@ -827,6 +844,24 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
                 )
                 .publish(env);
             }
+        } else if is_critical && cooldown_active {
+            // The bypass was warranted (liquid below floor, cooldown active)
+            // but the inner math yielded zero motion. The dominant cause is
+            // `principal_supplied == 0` — the handler holds nothing in Blend
+            // to pull back, so `bounded = natural.min(0) = 0`. Without this
+            // branch the entrypoint returns silently and operators cannot
+            // distinguish "no bypass needed" from "bypass needed but
+            // impossible". Emit a dedicated high-severity event so
+            // monitoring pages and the operator can intervene
+            // (`manual_to_blend` to seed principal, or top up liquid
+            // out-of-band).
+            CriticalBypassUnavailable::new(
+                liquid_ratio_bps,
+                critical_floor_bps,
+                principal,
+                soroban_sdk::symbol_short!("no_princ"),
+            )
+            .publish(env);
         }
     }
     // Inside the band: no-op.
