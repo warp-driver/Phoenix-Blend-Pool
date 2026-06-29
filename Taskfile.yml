@@ -80,6 +80,12 @@ vars:
   # Minimum seconds between two successive rebalance moves. 300s = 5 min:
   # plenty of room for trading flow to settle and avoid Blend min-supply churn.
   REBALANCE_COOLDOWN_SECS: '{{.REBALANCE_COOLDOWN_SECS | default "300"}}'
+  # Pool-side bootstrap trading floor (pool.set_min_trading_balances). Below
+  # these reserves `swap` reverts with TradingFloorNotMet; provide_liquidity
+  # and withdraw_liquidity are unaffected. Default 0 = no gate. Mainnet
+  # recommended floor: USDC=500_000_000_000 (50_000 USDC).
+  MIN_TRADING_USDC: '{{.MIN_TRADING_USDC | default "0"}}'
+  MIN_TRADING_XLM: '{{.MIN_TRADING_XLM | default "0"}}'
   TRIGGER_CHAIN: '{{.TRIGGER_CHAIN | default "stellar:pubnet"}}'
   MANAGER_CHAIN: '{{.MANAGER_CHAIN | default "stellar:pubnet"}}'
   WORKFLOW_ID: '{{.WORKFLOW_ID | default "rebalance"}}'
@@ -587,6 +593,31 @@ tasks:
             --source "$POOL_ADMIN_SECRET" \
             -- set_delegate --delegate "\"$HANDLER\""
         echo "delegate wired"
+
+  set-trading-floor:
+    desc: |
+      Set the bootstrap trading floor on the blended pool. Below the floor,
+      `swap` reverts with TradingFloorNotMet (337); deposits and withdrawals
+      are unaffected. Pool admin only. Reads MIN_TRADING_USDC (token_a side)
+      and MIN_TRADING_XLM (token_b side) from env — both default to 0 (no
+      gate). Pass overrides inline at call time, e.g.
+        MIN_TRADING_USDC=500000000000 task set-trading-floor
+      Idempotent — re-runs replace the prior values atomically.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
+        POOL_ADMIN_SECRET="${POOL_ADMIN_SECRET:-$DEPLOYER_SECRET}"
+        echo "setting trading floor on {{.BLENDED_POOL}}: a={{.MIN_TRADING_USDC}} b={{.MIN_TRADING_XLM}}"
+        stellar contract invoke \
+            --id "{{.BLENDED_POOL}}" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$POOL_ADMIN_SECRET" \
+            -- set_min_trading_balances \
+            --min_a "{{.MIN_TRADING_USDC}}" \
+            --min_b "{{.MIN_TRADING_XLM}}"
+        echo "trading floor set"
 
   unset-delegate:
     desc: |
