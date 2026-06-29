@@ -51,6 +51,9 @@ includes:
   testnet:
     taskfile: ./taskfiles/testnet.yml
     optional: false
+  mainnet:
+    taskfile: ./taskfiles/mainnet.yml
+    optional: false
   vps:
     taskfile: ./taskfiles/vps.yml
     optional: false
@@ -59,7 +62,7 @@ vars:
   RPC_URL: '{{.RPC_URL | default "https://soroban-testnet.stellar.org"}}'
   NETWORK_PASSPHRASE: '{{.NETWORK_PASSPHRASE | default "Test SDF Network ; September 2015"}}'
   BLENDED_POOL: '{{.BLENDED_POOL | default "CB000000000000000000000000000000000000000000000000000000"}}'
-  BLEND_POOL: '{{.BLEND_POOL | default "CDVQVKOY2YSXS2IC7KN6MNASSHPAO7UN2UR2ON4OI2SKMFJNVAMDX6DP"}}'
+  BLEND_POOL: '{{.BLEND_POOL | default "CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD"}}'
   USDC: '{{.USDC | default "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75"}}'
   XLM: '{{.XLM | default "CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA"}}'
   # BLND_TREASURY receives BLND emissions claimed during HarvestYield.
@@ -67,7 +70,7 @@ vars:
   # never holds BLND. Default placeholder; override per deploy with the
   # Phoenix/Blend-coordinated treasury address (DAO multisig, etc).
   BLND_TREASURY: '{{.BLND_TREASURY | default "CB000000000000000000000000000000000000000000000000000000"}}'
-  USDC_RESERVE_TOKEN_ID: '{{.USDC_RESERVE_TOKEN_ID | default "1"}}'
+  USDC_RESERVE_TOKEN_ID: '{{.USDC_RESERVE_TOKEN_ID | default "7"}}'
   # Rebalance policy (handler constructor args). target = 50% (5000 bps),
   # band = +/- 5% (500 bps), min total USDC below which Rebalance is a no-op
   # (1e11 = 10_000 USDC at the SAC's 7 decimals).
@@ -77,8 +80,21 @@ vars:
   # Minimum seconds between two successive rebalance moves. 300s = 5 min:
   # plenty of room for trading flow to settle and avoid Blend min-supply churn.
   REBALANCE_COOLDOWN_SECS: '{{.REBALANCE_COOLDOWN_SECS | default "300"}}'
+  # Critical-liquid floor (bps of total USDC). When the pool's liquid-side
+  # ratio drops below this floor, execute_rebalance bypasses the cooldown
+  # gate and fires a FromBlend rebalance immediately. 0 = feature disabled.
+  # Default 2000 (20%) — well below the normal lower band (target - band =
+  # 4500 bps = 45%) so the bypass only fires under genuine drift, not within
+  # the routine band.
+  CRITICAL_LIQUID_FLOOR_BPS: '{{.CRITICAL_LIQUID_FLOOR_BPS | default "2000"}}'
+  # Pool-side bootstrap trading floor (pool.set_min_trading_balances). Below
+  # these reserves `swap` reverts with TradingFloorNotMet; provide_liquidity
+  # and withdraw_liquidity are unaffected. Default 0 = no gate. Mainnet
+  # recommended floor: USDC=500_000_000_000 (50_000 USDC).
+  MIN_TRADING_USDC: '{{.MIN_TRADING_USDC | default "0"}}'
+  MIN_TRADING_XLM: '{{.MIN_TRADING_XLM | default "0"}}'
   TRIGGER_CHAIN: '{{.TRIGGER_CHAIN | default "stellar:pubnet"}}'
-  MANAGER_CHAIN: '{{.MANAGER_CHAIN | default "stellar:testnet"}}'
+  MANAGER_CHAIN: '{{.MANAGER_CHAIN | default "stellar:pubnet"}}'
   WORKFLOW_ID: '{{.WORKFLOW_ID | default "rebalance"}}'
   HARVEST_WORKFLOW_ID: '{{.HARVEST_WORKFLOW_ID | default "harvest"}}'
   # Standard cron with seconds field: "sec min hour day-of-month month day-of-week".
@@ -306,6 +322,23 @@ tasks:
         set -euo pipefail
         : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
         : "${DEPLOYER_ADDRESS:?DEPLOYER_ADDRESS is required}"
+        # Mainnet guard: on the Public Stellar Network, refuse to launch
+        # with the deployer hot key as handler admin (which would collapse
+        # pause / upgrade / emergency-unwind onto a single hot key). An
+        # explicit HANDLER_ADMIN MUST be supplied, and MUST be a contract
+        # address (C-strkey) — typically a Soroban multisig. G-strkeys are
+        # rejected; the admin needs to be revocable / rotatable post-launch
+        # and that's only true for contract-typed admins on Soroban.
+        if [ "{{.NETWORK_PASSPHRASE}}" = "Public Global Stellar Network ; September 2015" ]; then
+          if [ -z "${HANDLER_ADMIN:-}" ]; then
+            echo "HANDLER_ADMIN is required for mainnet deploy (refuse to collapse onto DEPLOYER_ADDRESS)" >&2
+            exit 1
+          fi
+          case "$HANDLER_ADMIN" in
+            C*) ;;
+            *) echo "HANDLER_ADMIN must be a contract (C-strkey, e.g. multisig); got '$HANDLER_ADMIN'" >&2; exit 1;;
+          esac
+        fi
         ADMIN="${HANDLER_ADMIN:-$DEPLOYER_ADDRESS}"
         VERIFICATION=$(jq -r .contracts.ed25519_verification out/deploy.json)
         HANDLER_ADDR=$(stellar contract deploy \
@@ -325,7 +358,8 @@ tasks:
             --target_ratio_bps "{{.TARGET_RATIO_BPS}}" \
             --rebalance_band_bps "{{.REBALANCE_BAND_BPS}}" \
             --min_total_usdc "{{.MIN_TOTAL_USDC}}" \
-            --rebalance_cooldown_secs "{{.REBALANCE_COOLDOWN_SECS}}")
+            --rebalance_cooldown_secs "{{.REBALANCE_COOLDOWN_SECS}}" \
+            --critical_liquid_floor_bps "{{.CRITICAL_LIQUID_FLOOR_BPS}}")
         echo "{\"automation_handler\":\"$HANDLER_ADDR\"}" | jq . > out/handler.json
         cat out/handler.json
 
@@ -568,6 +602,31 @@ tasks:
             -- set_delegate --delegate "\"$HANDLER\""
         echo "delegate wired"
 
+  set-trading-floor:
+    desc: |
+      Set the bootstrap trading floor on the blended pool. Below the floor,
+      `swap` reverts with TradingFloorNotMet (337); deposits and withdrawals
+      are unaffected. Pool admin only. Reads MIN_TRADING_USDC (token_a side)
+      and MIN_TRADING_XLM (token_b side) from env — both default to 0 (no
+      gate). Pass overrides inline at call time, e.g.
+        MIN_TRADING_USDC=500000000000 task set-trading-floor
+      Idempotent — re-runs replace the prior values atomically.
+    cmds:
+      - |
+        set -euo pipefail
+        : "${DEPLOYER_SECRET:?DEPLOYER_SECRET is required}"
+        POOL_ADMIN_SECRET="${POOL_ADMIN_SECRET:-$DEPLOYER_SECRET}"
+        echo "setting trading floor on {{.BLENDED_POOL}}: a={{.MIN_TRADING_USDC}} b={{.MIN_TRADING_XLM}}"
+        stellar contract invoke \
+            --id "{{.BLENDED_POOL}}" \
+            --rpc-url "{{.RPC_URL}}" \
+            --network-passphrase "{{.NETWORK_PASSPHRASE}}" \
+            --source "$POOL_ADMIN_SECRET" \
+            -- set_min_trading_balances \
+            --min_a "{{.MIN_TRADING_USDC}}" \
+            --min_b "{{.MIN_TRADING_XLM}}"
+        echo "trading floor set"
+
   unset-delegate:
     desc: |
       Emergency: clear the blended pool's delegate (set to None). Stops any
@@ -708,6 +767,7 @@ tasks:
         check rebalance_band_bps "{{.REBALANCE_BAND_BPS}}"
         check min_total_usdc "{{.MIN_TOTAL_USDC}}"
         check rebalance_cooldown_secs "{{.REBALANCE_COOLDOWN_SECS}}"
+        check critical_liquid_floor_bps "{{.CRITICAL_LIQUID_FLOOR_BPS}}"
         check paused         "false"
 
         # Pool-side check: delegate must equal the handler.

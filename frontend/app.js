@@ -540,8 +540,14 @@
   // ---- Render: Event log ------------------------------------------------
 
   // Project-specific event names that get a class hook for accent colours.
+  // NOTE: class hook becomes `evt-<topicName>`. CriticalRebalance and
+  // CriticalBypassUnavailable have no dedicated CSS yet — they currently
+  // share the generic accent. TODO(css): give CriticalBypassUnavailable a
+  // high-severity colour matching BadDebtDetected.
   const KNOWN_EVENT_TOPICS = new Set([
     "RebalanceExecuted",
+    "CriticalRebalance",
+    "CriticalBypassUnavailable",
     "HarvestCompleted",
     "BadDebtDetected",
     "EmergencyUnwound",
@@ -662,6 +668,16 @@
                `liquid_after=${fmtAmt(data.liquid_after)} ` +
                `delegated_after=${fmtAmt(data.delegated_after)} ` +
                `principal_after=${fmtAmt(data.principal_after)}`;
+      case "CriticalRebalance":
+        return `liquid_ratio=${data.liquid_ratio_bps}bps ` +
+               `floor=${data.floor_bps}bps ` +
+               `bypassed_cooldown=${data.bypassed_cooldown_secs}s`;
+      case "CriticalBypassUnavailable":
+        return `⚠️ BYPASS BLOCKED ` +
+               `liquid_ratio=${data.liquid_ratio_bps}bps ` +
+               `floor=${data.floor_bps}bps ` +
+               `principal=${fmtAmt(data.principal_supplied)} ` +
+               `reason=${data.reason}`;
       case "HarvestCompleted":
         return `interest_donated=${fmtAmt(data.interest_donated)} ` +
                `blnd_routed=${fmtAmt(data.blnd_routed)} ` +

@@ -14,6 +14,7 @@ pub enum DataKey {
     PrincipalSupplied,
     TargetRatioBps,
     RebalanceBandBps,
+    CriticalLiquidFloorBps,
     MinTotalUsdc,
     MaxRebalanceAmount,
     MinRebalanceAmount,
@@ -103,6 +104,27 @@ pub fn get_rebalance_band_bps(env: &Env) -> u32 {
         .instance()
         .get(&DataKey::RebalanceBandBps)
         .expect("rebalance band bps not set")
+}
+
+/// Critical liquid-USDC floor (bps). When the pool's `liquid / total` USDC
+/// ratio falls below this, `execute_rebalance` bypasses the cooldown gate so
+/// a burst of large swaps doesn't leave the pool unable to satisfy further
+/// trades during the cooldown window. A stored `0` is the "disabled"
+/// sentinel — the bypass never fires and the normal cooldown is the only
+/// rate-limit. The getter returns `0` when unset so legacy deploys upgraded
+/// without re-running the constructor behave identically to the
+/// pre-feature behaviour.
+pub fn save_critical_liquid_floor_bps(env: &Env, bps: u32) {
+    env.storage()
+        .instance()
+        .set(&DataKey::CriticalLiquidFloorBps, &bps);
+}
+
+pub fn get_critical_liquid_floor_bps(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::CriticalLiquidFloorBps)
+        .unwrap_or(0)
 }
 
 /// Floor on the pool's *total* USDC (liquid + delegated) below which Rebalance

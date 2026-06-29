@@ -147,6 +147,94 @@ impl BadDebtDetected {
     }
 }
 
+/// Emitted when execute_rebalance bypassed the cooldown gate because the
+/// pool's liquid USDC ratio fell below `critical_liquid_floor_bps`.
+/// Distinct from `RebalanceExecuted` so monitoring can alert specifically
+/// on the critical-bypass path. `liquid_ratio_bps` is the ratio AT entry
+/// (before the move); `floor_bps` is the configured floor.
+#[contractevent]
+pub struct CriticalRebalance {
+    pub liquid_ratio_bps: u32,
+    pub floor_bps: u32,
+    pub bypassed_cooldown_secs: u64,
+}
+
+impl CriticalRebalance {
+    pub fn new(liquid_ratio_bps: u32, floor_bps: u32, bypassed_cooldown_secs: u64) -> Self {
+        Self { liquid_ratio_bps, floor_bps, bypassed_cooldown_secs }
+    }
+}
+
+/// Emitted when execute_rebalance determined a critical-low bypass was
+/// warranted (liquid_ratio < critical_floor, cooldown active) but the
+/// rebalance couldn't actually pull funds from Blend — most commonly
+/// because the handler has no principal supplied (principal_supplied == 0)
+/// after an emergency_unwind or before the first ToBlend ever fired.
+/// Monitoring SHOULD treat this as a high-severity alert: the pool is at
+/// critical-low liquid but the handler cannot help. `reason` is a short
+/// Symbol describing the cause (currently only `"no_princ"` is emitted —
+/// principal_supplied == 0 — but the field reserves space for future
+/// causes without a schema break).
+#[contractevent]
+pub struct CriticalBypassUnavailable {
+    pub liquid_ratio_bps: u32,
+    pub floor_bps: u32,
+    pub principal_supplied: i128,
+    pub reason: Symbol,
+}
+
+impl CriticalBypassUnavailable {
+    pub fn new(
+        liquid_ratio_bps: u32,
+        floor_bps: u32,
+        principal_supplied: i128,
+        reason: Symbol,
+    ) -> Self {
+        Self {
+            liquid_ratio_bps,
+            floor_bps,
+            principal_supplied,
+            reason,
+        }
+    }
+}
+
+/// Emitted when the BLND claim leg of `execute_harvest_yield` succeeded but
+/// the interest leg (withdraw → resupply → donate) was skipped because
+/// Blend's `submit(WITHDRAW)` reverted — usually pool utilization at 100%
+/// or a frozen reserve mid-flight. `blnd_routed` is preserved (BLND went to
+/// treasury); `interest_donated` for the cycle is zero. Monitoring SHOULD
+/// alert on this event so the operator can investigate Blend health before
+/// the next harvest tick.
+#[contractevent]
+pub struct HarvestPartial {
+    pub blnd_routed: i128,
+}
+
+impl HarvestPartial {
+    pub fn new(blnd_routed: i128) -> Self {
+        Self { blnd_routed }
+    }
+}
+
+/// Emitted when `execute_harvest_yield` ran but produced no observable
+/// movement (no BLND claimed, no USDC interest donated). The cron tick
+/// still fired; monitoring can use this event to confirm operator
+/// liveness while gating "last_harvest_ts hasn't advanced" on real work.
+/// `reason` is one of: `"noprin"` (handler holds nothing in Blend),
+/// `"frozen"` (Blend pool status > healthy max), `"noyield"` (interest
+/// leg ran but yielded zero AND BLND claim returned zero).
+#[contractevent]
+pub struct HarvestSkipped {
+    pub reason: Symbol,
+}
+
+impl HarvestSkipped {
+    pub fn new(reason: Symbol) -> Self {
+        Self { reason }
+    }
+}
+
 /// Re-export `Env` for compatibility; not strictly needed but keeps the
 /// publish-call sites readable when the caller already has `env` in scope.
 #[allow(dead_code)]

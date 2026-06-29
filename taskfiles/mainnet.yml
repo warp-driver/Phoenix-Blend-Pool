@@ -1,0 +1,158 @@
+version: '3'
+
+# Stellar mainnet bring-up wrapper for phoenix-blend-pool.
+#
+# This file is a thin wrapper around taskfiles/testnet.yml: every actionable
+# task is implemented there. mainnet.yml supplies the mainnet env vars
+# (RPC, passphrase, asset ids, Blend pool) and adds a confirmation gate so
+# `task mainnet:full` can't accidentally fire a real-money deploy.
+#
+# Required env when calling:
+#   DEPLOYER_SECRET / DEPLOYER_ADDRESS    deployer hot key
+#   HANDLER_ADMIN                          C-strkey (multisig) — handler admin
+#   POOL_ADMIN                             C-strkey (multisig) — pool admin
+#   BLND_TREASURY                          C-strkey — receives BLND emissions
+#   PINATA_JWT                             IPFS pinning credential
+#   CONFIRM_MAINNET=yes                    explicit confirmation
+#
+# The mainnet-guard checks in testnet.yml (deploy-phoenix-pool +
+# deploy-handler) trip on the mainnet NETWORK_PASSPHRASE and refuse the
+# call unless POOL_ADMIN / HANDLER_ADMIN are supplied as contract addresses
+# — those are the pre-flight refusals for FIN-006 / FIN-007.
+#
+# Mainnet contract surface (Blend FixedV2 USDC pool, June 2026):
+#
+#   BLEND_POOL              CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD
+#   USDC                    CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75
+#   XLM (SAC)               CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA
+#   BLND                    CD25MNVTZDL4Y3XBCPCJXGXATV5WUHHOWMYFF4YBEGU5FCPGMYTVG5JY
+#   USDC_RESERVE_TOKEN_ID   7 (= reserve_index 3 * 2 + 1, supplier b-token)
+#
+# Confirm the BLEND_POOL + USDC_RESERVE_TOKEN_ID with `task testnet:lookup-usdc-reserve`
+# pointed at the mainnet pool before any production run; testnet.yml's lookup
+# task derives the id from get_reserve_list at the live pool address.
+
+vars:
+  RPC_URL_MAINNET: 'https://soroban-rpc.creit.tech'
+  NETWORK_PASSPHRASE_MAINNET: 'Public Global Stellar Network ; September 2015'
+  BLEND_POOL_MAINNET: 'CAJJZSGMMM3PD7N33TAPHGBUGTB43OC73HVIK2L2G6BNGGGYOSSYBXBD'
+  USDC_MAINNET: 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75'
+  XLM_MAINNET: 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA'
+  BLND_MAINNET: 'CD25MNVTZDL4Y3XBCPCJXGXATV5WUHHOWMYFF4YBEGU5FCPGMYTVG5JY'
+  USDC_RESERVE_TOKEN_ID_MAINNET: '7'
+  TRIGGER_CHAIN_MAINNET: 'stellar:pubnet'
+  MANAGER_CHAIN_MAINNET: 'stellar:pubnet'
+  # Mainnet policy defaults. Tighter cooldown + higher floor than testnet
+  # so the pool doesn't burn fees on micro-drifts and refuses to rebalance
+  # below a non-trivial total. Override per-deploy via env if needed.
+  TARGET_RATIO_BPS_MAINNET: '5000'
+  REBALANCE_BAND_BPS_MAINNET: '500'
+  MIN_TOTAL_USDC_MAINNET: '500000000000'
+  REBALANCE_COOLDOWN_SECS_MAINNET: '300'
+  # Critical-liquid floor (bps of total USDC). Below this fraction of
+  # total, execute_rebalance bypasses the cooldown and fires a FromBlend
+  # immediately. Default 2000 (20%) — well below the normal 4500 bps lower
+  # band so the bypass only fires under genuine drift. Tighter than the
+  # band gives more headroom; 0 disables the bypass entirely.
+  CRITICAL_LIQUID_FLOOR_BPS_MAINNET: '2000'
+  # Pool-side bootstrap trading floor is intentionally disabled on mainnet
+  # (value 0 = no gate). The 1% max-spread cap below is the only swap-time
+  # guard; trading is always-on so arbitrage can keep the pool's XLM/USDC
+  # price coupled to the external market continuously.
+  MIN_TRADING_USDC_MAINNET: '0'
+  MIN_TRADING_XLM_MAINNET: '0'
+  # Pool-side per-swap slippage cap. Phoenix's default max_allowed_spread_bps
+  # is 500 (5%); for the mainnet bootstrap we lock it tighter at 100 (1%) so
+  # any swap that would move the price by more than 1% reverts. This is the
+  # primary defence against thin-pool exploitation in the warm-up window —
+  # admin can widen via update_config post-launch if depth + volume warrant.
+  POOL_MAX_SPREAD_BPS_MAINNET: '100'
+
+tasks:
+  confirm:
+    desc: Refuse to proceed unless CONFIRM_MAINNET=yes is set in the environment.
+    cmds:
+      - |
+        set -euo pipefail
+        if [ "${CONFIRM_MAINNET:-no}" != "yes" ]; then
+          echo "REFUSING TO RUN: export CONFIRM_MAINNET=yes to proceed with a mainnet deploy." >&2
+          echo "This will deploy contracts on Stellar mainnet and move real funds." >&2
+          exit 1
+        fi
+        echo "mainnet deploy confirmation accepted"
+
+  full:
+    desc: |
+      End-to-end mainnet bring-up. Delegates to testnet.yml tasks with the
+      mainnet env vars set on this task; the testnet tasks resolve their
+      defaults against env so the overrides take effect transparently.
+      Requires CONFIRM_MAINNET=yes plus HANDLER_ADMIN + POOL_ADMIN
+      (testnet.yml enforces the C-strkey shape).
+    env:
+      RPC_URL: '{{.RPC_URL_MAINNET}}'
+      NETWORK_PASSPHRASE: '{{.NETWORK_PASSPHRASE_MAINNET}}'
+      BLEND_POOL: '{{.BLEND_POOL_MAINNET}}'
+      USDC: '{{.USDC_MAINNET}}'
+      XLM: '{{.XLM_MAINNET}}'
+      BLND: '{{.BLND_MAINNET}}'
+      USDC_RESERVE_TOKEN_ID: '{{.USDC_RESERVE_TOKEN_ID_MAINNET}}'
+      TRIGGER_CHAIN: '{{.TRIGGER_CHAIN_MAINNET}}'
+      MANAGER_CHAIN: '{{.MANAGER_CHAIN_MAINNET}}'
+      TARGET_RATIO_BPS: '{{.TARGET_RATIO_BPS_MAINNET}}'
+      REBALANCE_BAND_BPS: '{{.REBALANCE_BAND_BPS_MAINNET}}'
+      MIN_TOTAL_USDC: '{{.MIN_TOTAL_USDC_MAINNET}}'
+      REBALANCE_COOLDOWN_SECS: '{{.REBALANCE_COOLDOWN_SECS_MAINNET}}'
+      CRITICAL_LIQUID_FLOOR_BPS: '{{.CRITICAL_LIQUID_FLOOR_BPS_MAINNET}}'
+      MIN_TRADING_USDC: '{{.MIN_TRADING_USDC_MAINNET}}'
+      MIN_TRADING_XLM: '{{.MIN_TRADING_XLM_MAINNET}}'
+      POOL_MAX_SPREAD_BPS: '{{.POOL_MAX_SPREAD_BPS_MAINNET}}'
+    cmds:
+      - task: confirm
+      - task: testnet:preflight
+      - task: testnet:check-balances
+      - task: testnet:build-phoenix-wasms
+      - task: testnet:upload-phoenix-wasms
+      - task: testnet:deploy-phoenix-pool
+      - task: testnet:lookup-usdc-reserve
+      - task: testnet:deploy-handler-stack
+      - task: testnet:set-delegate
+      - task: testnet:verify-deploy
+      - task: testnet:make-frontend-config
+      - |
+        echo
+        echo "=========================================="
+        echo "Mainnet bring-up complete."
+        echo "Next steps:"
+        echo "  1. task vps:full          # provision operator nodes"
+        echo "  2. task mainnet:publish   # pin service.json + register on project_root"
+        echo "  3. wire monitoring for BadDebtDetected / EmergencyUnwound / PauseToggled / HarvestSkipped(>N consecutive)"
+
+  publish:
+    desc: |
+      Pin service.json to IPFS and register the URI on project_root for the
+      mainnet operator network. Requires CONFIRM_MAINNET=yes + PINATA_JWT.
+    env:
+      RPC_URL: '{{.RPC_URL_MAINNET}}'
+      NETWORK_PASSPHRASE: '{{.NETWORK_PASSPHRASE_MAINNET}}'
+      BLEND_POOL: '{{.BLEND_POOL_MAINNET}}'
+      TRIGGER_CHAIN: '{{.TRIGGER_CHAIN_MAINNET}}'
+      MANAGER_CHAIN: '{{.MANAGER_CHAIN_MAINNET}}'
+    cmds:
+      - task: confirm
+      - task: build-service
+      - task: publish-service
+
+  make-frontend-config:
+    desc: |
+      Generate frontend/config.json for mainnet. Thin wrapper over the
+      testnet task; the underlying task derives horizon + stellar.expert
+      base from NETWORK_PASSPHRASE so the same task works for both nets.
+    env:
+      RPC_URL: '{{.RPC_URL_MAINNET}}'
+      NETWORK_PASSPHRASE: '{{.NETWORK_PASSPHRASE_MAINNET}}'
+      BLEND_POOL: '{{.BLEND_POOL_MAINNET}}'
+      USDC: '{{.USDC_MAINNET}}'
+      XLM: '{{.XLM_MAINNET}}'
+      BLND: '{{.BLND_MAINNET}}'
+    cmds:
+      - task: testnet:make-frontend-config

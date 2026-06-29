@@ -9,7 +9,8 @@ use warpdrive_shared::interfaces::{
     warpdrive::{ContractUpgraded, WarpDriveInterface},
 };
 use crate::events::{
-    AddressConfigUpdated, BadDebtDetected, ConfigUpdated, EmergencyUnwound, HarvestCompleted,
+    AddressConfigUpdated, BadDebtDetected, ConfigUpdated, CriticalBypassUnavailable,
+    CriticalRebalance, EmergencyUnwound, HarvestCompleted, HarvestPartial, HarvestSkipped,
     PauseToggled, RebalanceExecuted, DIRECTION_FROM_BLEND, DIRECTION_TO_BLEND,
 };
 use crate::externals::{
@@ -28,6 +29,17 @@ const BPS_DEN: i128 = 10_000;
 /// becomes a no-op and Harvest skips the withdraw/resupply leg. Admin can
 /// always call `emergency_unwind` to drain a Frozen position explicitly.
 const BLEND_HEALTHY_STATUS_MAX: u32 = 3;
+
+/// Maximum age of a quorum envelope's `reference_block` accepted by
+/// `verify_xlm`. The aggregator stamps the envelope with the current
+/// ledger sequence at signature time; the on-chain verification
+/// contract checks the registered signer set AS OF that ledger. A
+/// stale `reference_block` lets a previously-quorate (but since
+/// retired) signer set re-pass verification, so we bound how far back
+/// it can point. 200 ledgers ≈ 17 minutes on mainnet (5-6 s/ledger);
+/// well above any plausible aggregator → operator → submission latency,
+/// well below the security contract's historical-weight retention.
+const MAX_REFERENCE_BLOCK_AGE: u32 = 200;
 
 /// Payload encoded inside the XlmEnvelope by the off-chain circuit + quorum.
 ///
@@ -71,6 +83,7 @@ pub struct HandlerState {
     pub usdc_reserve_token_id: u32,
     pub target_ratio_bps: u32,
     pub rebalance_band_bps: u32,
+    pub critical_liquid_floor_bps: u32,
     pub min_total_usdc: i128,
     pub max_rebalance_amount: i128,
     pub min_rebalance_amount: i128,
@@ -102,6 +115,7 @@ impl AutomationHandler {
         rebalance_band_bps: u32,
         min_total_usdc: i128,
         rebalance_cooldown_secs: u64,
+        critical_liquid_floor_bps: u32,
     ) {
         assert!(
             target_ratio_bps > 0 && target_ratio_bps < BPS_DEN as u32,
@@ -111,7 +125,24 @@ impl AutomationHandler {
             rebalance_band_bps < BPS_DEN as u32,
             "rebalance_band_bps must be < 10000"
         );
+        // critical_liquid_floor_bps strictly below the normal lower band
+        // (target - band). Above that, the floor would overlap with the
+        // normal cooldown-respecting rebalance window — letting an admin
+        // typo (e.g. 9_999) effectively disable the cooldown gate entirely.
+        // Below the lower band, the bypass only ever fires for genuinely
+        // critical drift.
+        let lower_band = target_ratio_bps.saturating_sub(rebalance_band_bps);
+        assert!(
+            critical_liquid_floor_bps < lower_band,
+            "critical_liquid_floor_bps must be < target_ratio_bps - rebalance_band_bps"
+        );
         assert!(min_total_usdc >= 0, "min_total_usdc must be non-negative");
+        if usdc_reserve_token_id % 2 == 0 {
+            soroban_sdk::panic_with_error!(
+                &env,
+                crate::error::LocalError::InvalidReserveTokenId
+            );
+        }
 
         storage::set_admin(&env, &admin);
         storage::set_verification_contract(&env, &verification_contract);
@@ -123,6 +154,7 @@ impl AutomationHandler {
         storage::set_usdc_reserve_token_id(&env, usdc_reserve_token_id);
         storage::set_target_ratio_bps(&env, target_ratio_bps);
         storage::set_rebalance_band_bps(&env, rebalance_band_bps);
+        storage::save_critical_liquid_floor_bps(&env, critical_liquid_floor_bps);
         storage::set_min_total_usdc(&env, min_total_usdc);
         // max/min rebalance scope limits default to 0 ("unlimited" / "no
         // floor") and are tightened post-deploy by the admin via setters.
@@ -155,6 +187,13 @@ impl AutomationHandler {
 
         if storage::is_event_seen(&env, &event_id) {
             return Err(HandlerError::EventAlreadySeen);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if sig_data.reference_block > current_ledger
+            || current_ledger - sig_data.reference_block > MAX_REFERENCE_BLOCK_AGE
+        {
+            return Err(HandlerError::InvalidReferenceBlock);
         }
 
         let verification_addr = storage::get_verification_contract(&env);
@@ -202,6 +241,10 @@ impl AutomationHandler {
 
     pub fn rebalance_band_bps(env: Env) -> u32 {
         storage::get_rebalance_band_bps(&env)
+    }
+
+    pub fn critical_liquid_floor_bps(env: Env) -> u32 {
+        storage::get_critical_liquid_floor_bps(&env)
     }
 
     pub fn min_total_usdc(env: Env) -> i128 {
@@ -254,6 +297,7 @@ impl AutomationHandler {
             usdc_reserve_token_id: storage::get_usdc_reserve_token_id(&env),
             target_ratio_bps: storage::get_target_ratio_bps(&env),
             rebalance_band_bps: storage::get_rebalance_band_bps(&env),
+            critical_liquid_floor_bps: storage::get_critical_liquid_floor_bps(&env),
             min_total_usdc: storage::get_min_total_usdc(&env),
             max_rebalance_amount: storage::get_max_rebalance_amount(&env),
             min_rebalance_amount: storage::get_min_rebalance_amount(&env),
@@ -488,6 +532,31 @@ impl AutomationHandler {
         storage::extend_instance_ttl(&env);
     }
 
+    /// Admin-only: critical liquid-USDC ratio (bps) below which
+    /// `execute_rebalance` bypasses the cooldown gate and pulls USDC from
+    /// Blend immediately. `0` disables the bypass entirely (cooldown is the
+    /// only rate-limit).
+    ///
+    /// Bound: must be strictly less than the normal lower band
+    /// (`target_ratio_bps - rebalance_band_bps`). Above that, the bypass
+    /// would overlap with the normal cooldown-respecting rebalance window,
+    /// effectively disabling the cooldown gate. An admin typo near 10_000
+    /// is the canonical failure this guard prevents. The bypass is only
+    /// ever useful for ratios genuinely BELOW the lower band, so the bound
+    /// rejects anything else.
+    pub fn set_critical_liquid_floor_bps(env: Env, bps: u32) {
+        storage::get_admin(&env).require_auth();
+        let target = storage::get_target_ratio_bps(&env);
+        let band = storage::get_rebalance_band_bps(&env);
+        let lower = target.saturating_sub(band);
+        if bps >= lower {
+            soroban_sdk::panic_with_error!(&env, HandlerError::InvalidEnvelope);
+        }
+        storage::save_critical_liquid_floor_bps(&env, bps);
+        ConfigUpdated::new(soroban_sdk::symbol_short!("crit_bps"), bps as i128).publish(&env);
+        storage::extend_instance_ttl(&env);
+    }
+
     /// Admin-only: floor on total pool USDC below which Rebalance is a
     /// no-op (does not consume cooldown).
     pub fn set_min_total_usdc(env: Env, amount: i128) {
@@ -522,6 +591,12 @@ impl AutomationHandler {
     /// reserve set or the handler is repointed at a new Blend pool.
     pub fn set_usdc_reserve_token_id(env: Env, id: u32) {
         storage::get_admin(&env).require_auth();
+        if id % 2 == 0 {
+            soroban_sdk::panic_with_error!(
+                &env,
+                crate::error::LocalError::InvalidReserveTokenId
+            );
+        }
         storage::set_usdc_reserve_token_id(&env, id);
         ConfigUpdated::new(soroban_sdk::symbol_short!("usdc_id"), id as i128).publish(&env);
         storage::extend_instance_ttl(&env);
@@ -583,6 +658,16 @@ impl AutomationHandler {
         execute_rebalance(&env)
     }
 
+    /// Set `last_rebalance_ts` and run `execute_rebalance` in a SINGLE
+    /// top-level invocation. The Soroban test env's `events().all()` returns
+    /// events from the most recent top-level call only, so tests that want to
+    /// inspect events emitted by `execute_rebalance` MUST avoid sandwiching
+    /// other handler calls between the setup and the rebalance.
+    pub fn test_rebalance_with_last_ts(env: Env, last_ts: u64) -> Result<(), HandlerError> {
+        storage::set_last_rebalance_ts(&env, last_ts);
+        execute_rebalance(&env)
+    }
+
     pub fn test_harvest(env: Env) -> Result<(), HandlerError> {
         execute_harvest_yield(&env)
     }
@@ -638,16 +723,10 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         return Err(HandlerError::InvalidEnvelope);
     }
 
-    // Cooldown gate: only ACTIONS (actual fund moves) are rate-limited.
-    // No-op branches (below min, within band, dust) return without touching
-    // last_rebalance_ts, so the next event after a gap can still react.
-    let now = env.ledger().timestamp();
-    let last_ts = storage::get_last_rebalance_ts(env);
-    let cooldown = storage::get_rebalance_cooldown_secs(env);
-    if now < last_ts.saturating_add(cooldown) {
-        return Ok(());
-    }
-
+    // Compute the target / band BEFORE the cooldown gate because the
+    // critical-low bypass below needs `target_liquid` to know whether the
+    // pool is under-liquid (the bypass only ever fires on the FromBlend
+    // side; we never want to bypass cooldown for an over-liquid rebalance).
     let target_bps = storage::get_target_ratio_bps(env) as i128;
     let band_bps = storage::get_rebalance_band_bps(env) as i128;
     let target_liquid = mul_div(total_usdc, target_bps, BPS_DEN)?;
@@ -656,6 +735,38 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
         .checked_add(band)
         .ok_or(HandlerError::OtherInvocationError)?;
     let lower = target_liquid.saturating_sub(band);
+
+    // Cooldown gate: only ACTIONS (actual fund moves) are rate-limited.
+    // No-op branches (below min, within band, dust) return without touching
+    // last_rebalance_ts, so the next event after a gap can still react.
+    let now = env.ledger().timestamp();
+    let last_ts = storage::get_last_rebalance_ts(env);
+    let cooldown = storage::get_rebalance_cooldown_secs(env);
+    let cooldown_active = now < last_ts.saturating_add(cooldown);
+
+    // Critical-low bypass: if liquid USDC has dropped catastrophically below
+    // the configured floor (e.g. a burst of large swaps drained the pool's
+    // liquid side while we were in cooldown), fire the rebalance now
+    // regardless. The floor_bps is a fraction of `total_usdc` (= liquid +
+    // delegated); below it, the pool is at risk of not being able to satisfy
+    // near-term swap volume. `critical_floor_bps == 0` is the "disabled"
+    // sentinel — the bypass never fires and the normal cooldown gate is the
+    // only rate-limit. The `liquid_usdc < target_liquid` clause keeps the
+    // bypass restricted to the FromBlend side: we never want to skip the
+    // cooldown for an over-liquid (ToBlend) rebalance.
+    let critical_floor_bps = storage::get_critical_liquid_floor_bps(env);
+    let liquid_ratio_bps = if total_usdc > 0 {
+        mul_div(liquid_usdc, BPS_DEN, total_usdc)? as u32
+    } else {
+        0
+    };
+    let is_critical = critical_floor_bps > 0
+        && liquid_ratio_bps < critical_floor_bps
+        && liquid_usdc < target_liquid;
+
+    if cooldown_active && !is_critical {
+        return Ok(());
+    }
 
     let delegated_before = total_usdc - liquid_usdc;
     let max_cap = storage::get_max_rebalance_amount(env);
@@ -725,6 +836,32 @@ fn execute_rebalance(env: &Env) -> Result<(), HandlerError> {
                 principal_after,
             )
             .publish(env);
+            if is_critical && cooldown_active {
+                CriticalRebalance::new(
+                    liquid_ratio_bps,
+                    critical_floor_bps,
+                    last_ts.saturating_add(cooldown).saturating_sub(now),
+                )
+                .publish(env);
+            }
+        } else if is_critical && cooldown_active {
+            // The bypass was warranted (liquid below floor, cooldown active)
+            // but the inner math yielded zero motion. The dominant cause is
+            // `principal_supplied == 0` — the handler holds nothing in Blend
+            // to pull back, so `bounded = natural.min(0) = 0`. Without this
+            // branch the entrypoint returns silently and operators cannot
+            // distinguish "no bypass needed" from "bypass needed but
+            // impossible". Emit a dedicated high-severity event so
+            // monitoring pages and the operator can intervene
+            // (`manual_to_blend` to seed principal, or top up liquid
+            // out-of-band).
+            CriticalBypassUnavailable::new(
+                liquid_ratio_bps,
+                critical_floor_bps,
+                principal,
+                soroban_sdk::symbol_short!("no_princ"),
+            )
+            .publish(env);
         }
     }
     // Inside the band: no-op.
@@ -775,40 +912,78 @@ fn execute_harvest_yield(env: &Env) -> Result<(), HandlerError> {
     if principal > 0 && blend_healthy {
         let usdc_token = soroban_sdk::token::Client::new(env, &usdc);
         let usdc_before_withdraw = usdc_token.balance(&env.current_contract_address());
-        blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_WITHDRAW, i128::MAX);
-        let actual_redeemable = usdc_token
-            .balance(&env.current_contract_address())
-            .saturating_sub(usdc_before_withdraw);
 
-        let supply_amount = principal.min(actual_redeemable);
-        if supply_amount > 0 {
-            blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, supply_amount);
-        }
-        storage::set_principal_supplied(env, supply_amount);
-        principal_after = supply_amount;
+        // Withdraw via try_submit so a Blend revert (e.g. utilization at
+        // 100% rejecting the withdraw, status flipping to Frozen between
+        // get_config and submit) does NOT roll back the BLND claim above.
+        // Soroban contract panics roll back the WHOLE tx by default;
+        // try_<method> is the auto-generated recoverable form on every
+        // contractclient trait.
+        let mut requests: Vec<BlendRequest> = Vec::new(env);
+        requests.push_back(BlendRequest {
+            request_type: BLEND_REQUEST_WITHDRAW,
+            address: usdc.clone(),
+            amount: i128::MAX,
+        });
+        let withdraw_ok = matches!(
+            blend.try_submit(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &requests,
+            ),
+            Ok(Ok(_))
+        );
+        if !withdraw_ok {
+            HarvestPartial::new(blnd_routed).publish(env);
+        } else {
+            let actual_redeemable = usdc_token
+                .balance(&env.current_contract_address())
+                .saturating_sub(usdc_before_withdraw);
 
-        // Bad-debt detection: if Blend redeemed less than the handler's
-        // recorded principal, the b-token position has been written down.
-        // Emit a high-signal event for monitoring; the handler proceeds
-        // with the smaller principal (silent correction; not a panic).
-        if actual_redeemable < principal {
-            BadDebtDetected::new(
-                principal,
-                actual_redeemable,
-                principal - actual_redeemable,
-            )
-            .publish(env);
-        }
+            let supply_amount = principal.min(actual_redeemable);
+            if supply_amount > 0 {
+                blend_submit(env, &blend_pool, &usdc, BLEND_REQUEST_SUPPLY, supply_amount);
+            }
+            storage::set_principal_supplied(env, supply_amount);
+            principal_after = supply_amount;
 
-        let interest = actual_redeemable.saturating_sub(supply_amount);
-        if interest > 0 {
-            donate_to_pool(env, &blended_pool, &usdc, interest);
-            interest_donated = interest;
+            // Bad-debt detection: if Blend redeemed less than the handler's
+            // recorded principal, the b-token position has been written down.
+            // Emit a high-signal event for monitoring; the handler proceeds
+            // with the smaller principal (silent correction; not a panic).
+            if actual_redeemable < principal {
+                BadDebtDetected::new(
+                    principal,
+                    actual_redeemable,
+                    principal - actual_redeemable,
+                )
+                .publish(env);
+            }
+
+            let interest = actual_redeemable.saturating_sub(supply_amount);
+            if interest > 0 {
+                donate_to_pool(env, &blended_pool, &usdc, interest);
+                interest_donated = interest;
+            }
         }
     }
 
-    storage::set_last_harvest_ts(env, env.ledger().timestamp());
-    HarvestCompleted::new(interest_donated, blnd_routed, principal_after).publish(env);
+    let work_done = blnd_routed > 0 || interest_donated > 0;
+    if work_done {
+        storage::set_last_harvest_ts(env, env.ledger().timestamp());
+        HarvestCompleted::new(interest_donated, blnd_routed, principal_after)
+            .publish(env);
+    } else {
+        let reason = if !blend_healthy {
+            soroban_sdk::symbol_short!("frozen")
+        } else if principal == 0 {
+            soroban_sdk::symbol_short!("noprin")
+        } else {
+            soroban_sdk::symbol_short!("noyield")
+        };
+        HarvestSkipped::new(reason).publish(env);
+    }
 
     assert_no_usdc_residue(env);
     Ok(())
